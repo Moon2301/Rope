@@ -562,11 +562,16 @@ class Models():
         # streams refactor; it removes the cross-worker host stall on
         # the global default stream that prior nsys traces showed as
         # the next bottleneck.
-        if self._swapper_should_drain_syncvec():
+        safe_cuda_boundary = not bool(getattr(self, '_swapper_uses_trt', False))
+        if safe_cuda_boundary:
+            torch.cuda.synchronize()
+        elif self._swapper_should_drain_syncvec():
             with nvtx_range("syncvec_drain"):
                 self.syncvec.cpu()
         with nvtx_range("ort_run_swapper"):
             swapper_session.run_with_iobinding(io_binding)
+        if safe_cuda_boundary:
+            torch.cuda.synchronize()
 
         # If we ran in FP16 mode, lift the result back into the
         # caller's FP32 buffer. copy_ handles the dtype conversion.
@@ -939,6 +944,7 @@ class Models():
                 # still binds to the worker stream — a bare string entry
                 # would drop the stream and run on the default stream.
                 cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
+                cuda_options.pop('user_compute_stream', None)
                 sess = onnxruntime.InferenceSession(
                     onnx_path,
                     sess_options=sess_options,
@@ -957,6 +963,7 @@ class Models():
             # one-time conv benchmark is absorbed by the startup preload
             # warm-up (see preload_pipeline_sessions).
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
+            cuda_options.pop('user_compute_stream', None)
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
                 onnx_path,
