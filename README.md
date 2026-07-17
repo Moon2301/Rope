@@ -28,6 +28,11 @@ Rope implements the insightface inswapper_128 model with a helpful GUI.
 
 **Cancel scan** stops after the current model call. **Cancel render** safely closes the current part and writes a checkpoint. Open Auto Segments again and click **Continue render** to resume from the next frame; completed parts are concatenated automatically at the end.
 
+Long videos are scanned sequentially in five-minute chunks. The default
+0.5-second coarse pass is refined every three frames around matches and
+near-matches. Completed chunks are cached, so pressing Scan again after a
+cancel or restart resumes without rescanning finished chunks.
+
 ### Install from scratch:
 ```cmd
 py -3.12 -m venv venv

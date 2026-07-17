@@ -54,8 +54,8 @@ from rope.qt.widgets.embedding_merge_dialog import (
 from rope.qt.widgets.text import Text
 from rope.qt.widgets.vram_indicator import VRAMIndicator
 from rope.AutoSegments import (
-    approved_ranges, group_matches, load_scan_cache, save_scan_cache,
-    scan_cache_key,
+    SequentialScanDecoder, approved_ranges, group_matches,
+    load_scan_manifest, save_scan_manifest, scan_cache_key,
 )
 from rope.qt.widgets.auto_segments_dialog import AutoSegmentsDialog
 
@@ -103,19 +103,19 @@ def _cosine_similarity_pct(v1: np.ndarray, v2: np.ndarray) -> float:
 
 
 class _AutoScanSignals(QObject):
-    progress = Signal(int, int)
+    progress = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
 
 
 class _AutoScanWorker(QRunnable):
-    def __init__(self, vm, target_embedding, threshold, stride, gap, padding,
-                 cache_dir, cancel_event):
+    def __init__(self, vm, target_embedding, threshold, sample_interval,
+                 gap, padding, cache_dir, cancel_event):
         super().__init__()
         self.vm = vm
         self.target = np.asarray(target_embedding, dtype=np.float32)
         self.threshold = float(threshold)
-        self.stride = int(stride)
+        self.sample_interval = float(sample_interval)
         self.gap = int(gap)
         self.padding = int(padding)
         self.cache_dir = cache_dir
@@ -129,46 +129,132 @@ class _AutoScanWorker(QRunnable):
             player = self.vm.player
             params = dict(self.vm.parameters)
             total_frames = int(self.vm.video_frame_total)
+            fps = float(self.vm.fps)
+            coarse_stride = max(1, int(round(fps * self.sample_interval)))
+            refine_stride = 3
+            refine_radius = max(1, int(round(fps * 1.0)))
+            chunk_frames = max(1, int(round(fps * 300.0)))
+            total_chunks = max(1, int(np.ceil(total_frames / chunk_frames)))
             config = {
-                'threshold': self.threshold, 'stride': self.stride,
+                'algorithm_version': 2,
+                'threshold': self.threshold,
+                'sample_interval_seconds': self.sample_interval,
+                'refine_radius_seconds': 1.0,
+                'refine_stride_frames': refine_stride,
+                'chunk_seconds': 300,
+                'near_hit_margin': 8.0,
                 'gap': self.gap, 'padding': self.padding,
                 'detector': str(params.get('DetectTypeTextSel', 'Retinaface')),
                 'detect_score': float(params.get('DetectScoreSlider', 50)),
                 'input_size': int(params.get('DetectInputSizeTextSel', 640)),
             }
             key = scan_cache_key(self.vm.target_video, self.target, config)
-            segments = load_scan_cache(self.cache_dir, key)
-            cached = segments is not None
-            sample_frames = list(range(0, total_frames, max(1, self.stride)))
-            matches = []
-            if segments is None:
-                for index, frame_no in enumerate(sample_frames, 1):
-                    if self.cancel_event.is_set():
-                        self.signals.failed.emit("Đã hủy scan.")
-                        return
-                    frame, _pts = player.get_frame_at(frame_no)
-                    if isinstance(frame, torch.Tensor):
-                        image = frame.to(device='cuda', dtype=torch.uint8)
-                    else:
-                        image = torch.from_numpy(np.asarray(frame, dtype=np.uint8)).to('cuda')
-                    image = image.permute(2, 0, 1)
-                    kpss = self.vm.models.run_detect(
-                        image, config['detector'], max_num=20,
-                        score=config['detect_score'] / 100.0,
-                        input_size=config['input_size'],
-                    )
-                    best = 0.0
-                    for kps in kpss:
-                        embedding, _crop = self.vm.models.run_recognize(image, kps)
-                        best = max(best, _cosine_similarity_pct(embedding, self.target))
-                    if best >= self.threshold:
-                        matches.append((frame_no, best))
-                    self.signals.progress.emit(index, len(sample_frames))
-                segments = group_matches(
-                    matches, stride=self.stride, gap_frames=self.gap,
-                    padding_frames=self.padding, total_frames=total_frames,
+            manifest = load_scan_manifest(self.cache_dir, key) or {
+                'config': config, 'completed_chunks': [], 'chunks': {},
+            }
+            completed = {int(value) for value in manifest.get('completed_chunks', [])}
+            cached = len(completed) == total_chunks
+            decoder = SequentialScanDecoder(
+                self.vm.target_video, fps, total_frames,
+            )
+            scan_started = time.perf_counter()
+
+            def emit_progress(chunk_index, stage, stage_current, stage_total):
+                stage_fraction = stage_current / max(1, stage_total)
+                stage_offset = 0.0 if stage == 'coarse' else 0.5
+                chunk_fraction = stage_offset + stage_fraction * 0.5
+                fraction = min(1.0, (chunk_index + chunk_fraction) / total_chunks)
+                elapsed = time.perf_counter() - scan_started
+                eta = int(elapsed * (1.0 - fraction) / fraction) if fraction > 0 else 0
+                self.signals.progress.emit({
+                    'chunk': chunk_index + 1, 'chunks': total_chunks,
+                    'stage': stage, 'percent': fraction * 100.0,
+                    'eta_seconds': eta,
+                })
+
+            def score_rgb(rgb):
+                image = torch.from_numpy(
+                    np.ascontiguousarray(rgb, dtype=np.uint8)
+                ).to('cuda').permute(2, 0, 1)
+                kpss = self.vm.models.run_detect(
+                    image, config['detector'], max_num=20,
+                    score=config['detect_score'] / 100.0,
+                    input_size=config['input_size'],
                 )
-                save_scan_cache(self.cache_dir, key, segments)
+                best = 0.0
+                for kps in kpss:
+                    embedding, _crop = self.vm.models.run_recognize(image, kps)
+                    best = max(best, _cosine_similarity_pct(embedding, self.target))
+                return best
+
+            for chunk_index in range(total_chunks):
+                if chunk_index in completed:
+                    emit_progress(chunk_index, 'cache', 1, 1)
+                    continue
+                start = chunk_index * chunk_frames
+                end = min(total_frames, start + chunk_frames)
+                coarse_targets = list(range(start, end, coarse_stride))
+                coarse_hits = {}
+                near_hits = {}
+                for sample_index, (frame_no, rgb) in enumerate(
+                    decoder.iter_frames(coarse_targets, self.cancel_event), 1
+                ):
+                    similarity = score_rgb(rgb)
+                    if similarity >= self.threshold:
+                        coarse_hits[frame_no] = similarity
+                    elif similarity >= self.threshold - 8.0:
+                        near_hits[frame_no] = similarity
+                    emit_progress(
+                        chunk_index, 'coarse', sample_index, len(coarse_targets)
+                    )
+                if self.cancel_event.is_set():
+                    self.signals.failed.emit("Đã hủy scan; các chunk trước đã được lưu.")
+                    return
+
+                candidates = sorted(set(coarse_hits) | set(near_hits))
+                refine_targets = sorted({
+                    frame
+                    for candidate in candidates
+                    for frame in range(
+                        max(start, candidate - refine_radius),
+                        min(end, candidate + refine_radius + 1),
+                        refine_stride,
+                    )
+                })
+                refined_hits = dict(coarse_hits)
+                for sample_index, (frame_no, rgb) in enumerate(
+                    decoder.iter_frames(refine_targets, self.cancel_event), 1
+                ):
+                    similarity = score_rgb(rgb)
+                    if similarity >= self.threshold:
+                        refined_hits[frame_no] = max(
+                            similarity, refined_hits.get(frame_no, 0.0)
+                        )
+                    emit_progress(
+                        chunk_index, 'refine', sample_index, len(refine_targets)
+                    )
+                if not refine_targets:
+                    emit_progress(chunk_index, 'refine', 1, 1)
+                if self.cancel_event.is_set():
+                    self.signals.failed.emit("Đã hủy scan; các chunk trước đã được lưu.")
+                    return
+
+                manifest.setdefault('chunks', {})[str(chunk_index)] = {
+                    'start_frame': start, 'end_frame': end - 1,
+                    'hits': [[frame, score] for frame, score in sorted(refined_hits.items())],
+                    'near_hits': [[frame, score] for frame, score in sorted(near_hits.items())],
+                }
+                completed.add(chunk_index)
+                manifest['completed_chunks'] = sorted(completed)
+                save_scan_manifest(self.cache_dir, key, manifest)
+
+            matches = []
+            for chunk in manifest.get('chunks', {}).values():
+                matches.extend((int(frame), float(score)) for frame, score in chunk.get('hits', []))
+            segments = group_matches(
+                matches, stride=refine_stride, gap_frames=self.gap,
+                padding_frames=self.padding, total_frames=total_frames,
+            )
 
             thumbnails = {}
             for row, segment in enumerate(segments):
@@ -601,7 +687,7 @@ class MainWindow(QMainWindow):
         self._auto_segments_dialog = dialog
         dialog.show()
 
-    def _start_auto_scan(self, stride: int, gap: int, padding: int) -> None:
+    def _start_auto_scan(self, sample_interval: float, gap: int, padding: int) -> None:
         vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
         dialog = getattr(self, '_auto_segments_dialog', None)
         if vm is None or dialog is None or not getattr(vm, 'is_video_loaded', False):
@@ -620,10 +706,10 @@ class MainWindow(QMainWindow):
         cache_dir = os.path.join(QStandardPaths.writableLocation(QStandardPaths.CacheLocation),
                                  'auto_segments')
         worker = _AutoScanWorker(
-            vm, slot['Embedding'], threshold, stride, gap, padding,
+            vm, slot['Embedding'], threshold, sample_interval, gap, padding,
             cache_dir, self._auto_scan_cancel,
         )
-        worker.signals.progress.connect(dialog.set_progress)
+        worker.signals.progress.connect(dialog.set_scan_progress)
         worker.signals.finished.connect(self._on_auto_scan_finished)
         worker.signals.failed.connect(dialog.set_error)
         self._auto_scan_worker = worker

@@ -4,7 +4,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QLabel, QPushButton, QSpinBox, QTableWidget,
+    QDoubleSpinBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -12,7 +12,7 @@ from rope.AutoSegments import AutoSegment
 
 
 class AutoSegmentsDialog(QDialog):
-    scan_requested = Signal(int, int, int)  # stride, gap, padding
+    scan_requested = Signal(float, int, int)  # interval seconds, gap, padding
     render_requested = Signal(object)
     seek_requested = Signal(int)
     cancel_scan_requested = Signal()
@@ -35,10 +35,15 @@ class AutoSegmentsDialog(QDialog):
 
         options = QHBoxLayout()
         form = QFormLayout()
-        self.stride = QSpinBox(); self.stride.setRange(1, 300); self.stride.setValue(10)
+        self.sample_interval = QDoubleSpinBox()
+        self.sample_interval.setRange(0.1, 5.0)
+        self.sample_interval.setSingleStep(0.1)
+        self.sample_interval.setDecimals(1)
+        self.sample_interval.setValue(0.5)
+        self.sample_interval.setSuffix(" s")
         self.gap = QSpinBox(); self.gap.setRange(0, 900); self.gap.setValue(20)
         self.padding = QSpinBox(); self.padding.setRange(0, 300); self.padding.setValue(10)
-        form.addRow("Sample mỗi (frame)", self.stride)
+        form.addRow("Coarse sample", self.sample_interval)
         form.addRow("Nối khoảng hở (frame)", self.gap)
         form.addRow("Padding (frame)", self.padding)
         options.addLayout(form)
@@ -88,10 +93,20 @@ class AutoSegmentsDialog(QDialog):
         self.cancel_scan_button.setEnabled(True)
         self.render_button.setEnabled(False)
         self.status.setText("Đang quét…")
-        self.scan_requested.emit(self.stride.value(), self.gap.value(), self.padding.value())
+        self.scan_requested.emit(
+            self.sample_interval.value(), self.gap.value(), self.padding.value()
+        )
 
-    def set_progress(self, current: int, total: int) -> None:
-        self.status.setText(f"Đang quét: {current}/{total} frame mẫu")
+    def set_scan_progress(self, data: dict) -> None:
+        percent = float(data.get("percent", 0.0))
+        chunk = int(data.get("chunk", 0))
+        chunks = int(data.get("chunks", 0))
+        stage = str(data.get("stage", "coarse"))
+        eta = max(0, int(data.get("eta_seconds", 0)))
+        self.status.setText(
+            f"Scan {stage}: chunk {chunk}/{chunks} - {percent:.1f}% - "
+            f"ETA {eta // 60:02d}:{eta % 60:02d}"
+        )
 
     def set_error(self, message: str) -> None:
         self.scan_button.setEnabled(True)

@@ -10,6 +10,64 @@ from pathlib import Path
 from typing import Iterable
 
 
+SCAN_CACHE_VERSION = 2
+
+
+class SequentialScanDecoder:
+    """Decode requested frames in one forward pass using a private container."""
+
+    def __init__(self, video_path: str, fps: float, total_frames: int):
+        self.video_path = str(video_path)
+        self.fps = max(0.001, float(fps))
+        self.total_frames = max(0, int(total_frames))
+
+    def iter_frames(self, frame_numbers: Iterable[int], cancel_event=None):
+        import av
+
+        targets = sorted({
+            max(0, min(self.total_frames - 1, int(frame)))
+            for frame in frame_numbers if self.total_frames > 0
+        })
+        if not targets:
+            return
+        container = av.open(self.video_path)
+        try:
+            stream = container.streams.video[0]
+            time_base = float(stream.time_base)
+            # Seek slightly before the first target, then only decode forward.
+            seek_seconds = max(0.0, targets[0] / self.fps - 2.0)
+            try:
+                container.seek(
+                    int(seek_seconds / time_base), stream=stream,
+                    any_frame=False, backward=True,
+                )
+            except Exception:
+                container.seek(0)
+            target_index = 0
+            for packet in container.demux(stream):
+                for decoded in packet.decode():
+                    if cancel_event is not None and cancel_event.is_set():
+                        return
+                    if decoded.pts is None:
+                        continue
+                    frame_no = int(round(float(decoded.pts) * time_base * self.fps))
+                    if frame_no < targets[target_index]:
+                        continue
+                    # The first decoded frame at/after a requested timestamp
+                    # is its sample. Normally this loop runs once; it also
+                    # handles sparse/VFR input without reopening the file.
+                    rgb = None
+                    while target_index < len(targets) and frame_no >= targets[target_index]:
+                        if rgb is None:
+                            rgb = decoded.to_ndarray(format='rgb24')
+                        yield targets[target_index], rgb
+                        target_index += 1
+                        if target_index >= len(targets):
+                            return
+        finally:
+            container.close()
+
+
 @dataclass
 class AutoSegment:
     start_frame: int
@@ -101,5 +159,27 @@ def save_scan_cache(cache_dir: str, key: str, segments: Iterable[AutoSegment]) -
     target = directory / f"{key}.json"
     temp = directory / f"{key}.{os.getpid()}.tmp"
     payload = {"version": 1, "segments": [item.to_dict() for item in segments]}
+    temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(temp, target)
+
+
+def load_scan_manifest(cache_dir: str, key: str) -> dict | None:
+    path = Path(cache_dir) / f"{key}.manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if int(data.get("version", 0)) != SCAN_CACHE_VERSION:
+            return None
+        return data
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_scan_manifest(cache_dir: str, key: str, manifest: dict) -> None:
+    directory = Path(cache_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{key}.manifest.json"
+    temp = directory / f"{key}.{os.getpid()}.manifest.tmp"
+    payload = dict(manifest)
+    payload["version"] = SCAN_CACHE_VERSION
     temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     os.replace(temp, target)
