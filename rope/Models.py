@@ -868,7 +868,14 @@ class Models():
             # nonsense like "./models\ort_trt_cache\./models\ort_trt_cache"
             # and the provider falls back silently to CUDA EP. Always
             # pass an absolute, normalized path.
-            cache_dir = os.path.abspath(self._mp("ort_trt_cache"))
+            # Engine caches do not encode every provider option in their
+            # filename. In particular, an engine built before
+            # trt_layer_norm_fp32_fallback was enabled can be loaded again
+            # and produce noise/garbled faces even though the current
+            # session requests the safe option. Version the inswapper cache
+            # directory so old unsafe FP16 engines are never reused.
+            cache_root = os.path.abspath(self._mp("ort_trt_cache"))
+            cache_dir = os.path.join(cache_root, "inswapper_lnfp32_v1")
             try:
                 os.makedirs(cache_dir, exist_ok=True)
             except OSError:
@@ -878,7 +885,9 @@ class Models():
                 'trt_engine_cache_enable': True,
                 'trt_engine_cache_path': cache_dir,
                 'trt_timing_cache_enable': True,
-                'trt_timing_cache_path': cache_dir,
+                # Timing data is safe to share; only serialized engines
+                # need the LayerNorm-policy-specific directory.
+                'trt_timing_cache_path': cache_root,
                 'trt_fp16_enable': True,
                 # The critical flag: keeps LayerNorm reductions in FP32
                 # even under FP16. Without this the FP16 path on
