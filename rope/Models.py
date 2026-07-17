@@ -184,7 +184,9 @@ class Models():
         # auto (current behavior — prefer TRT if engine present).
         # Driven by the Settings-tab Backend toggle and applied at the
         # next lazy load.
-        self._backend_pref: dict = {}
+        # Inswapper starts on CUDA EP for reliability. A persisted/user
+        # preference of "trt" still overrides this default.
+        self._backend_pref: dict = {'swapper_model': 'onnx'}
         self.syncvec = torch.empty((1,1), dtype=torch.float32, device='cuda:0')
 
         # Model session mode — controls every ORT-TRT-EP session the
@@ -857,7 +859,14 @@ class Models():
             pass
 
         pref = self._backend_pref.get('swapper_model')
-        want_trt = pref != 'onnx'
+        # Reliability-first default for identity generation. Some Ampere
+        # systems (notably RTX 3060 + particular ORT/TRT combinations)
+        # successfully build and execute the FP16 engine but return a
+        # ghosted/garbled face. Detection/recognition can still default to
+        # TRT; inswapper uses CUDA EP unless the user explicitly opts into
+        # TRT from Settings. This also gives a deterministic recovery path
+        # that does not depend on deleting/versioning an engine cache.
+        want_trt = pref == 'trt'
 
         onnx_path = self._mp("inswapper_128.fp16.onnx")
         sess = None
