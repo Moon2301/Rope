@@ -826,6 +826,37 @@ class MainWindow(QMainWindow):
         self._refresh_current_frame()
 
     def _on_toggle_swap_faces(self) -> None:
+        # Turning SwapFaces on without a complete target->source assignment
+        # used to fail silently: VideoManager correctly skipped every
+        # target-only slot, but the user only saw an unchanged preview and
+        # no inswapper load in the console. Block that invalid state here
+        # and explain the required workflow. Turning an already-on toggle
+        # off must always remain available.
+        turning_on = not bool(self._control.get("SwapFacesButton", False))
+        if turning_on:
+            assigned = [
+                slot for slot in self._found_faces
+                if slot.get("SourceFaceAssignments")
+                and slot.get("AssignedEmbedding") is not None
+            ]
+            if not assigned:
+                if not self._found_faces:
+                    detail = (
+                        "Chưa có Found Face.\n\n"
+                        "1. Tới frame thấy rõ nhân vật.\n"
+                        "2. Bấm Find Faces.\n"
+                        "3. Chọn Source Face và gán vào Found Face."
+                    )
+                else:
+                    detail = (
+                        "Found Face chưa được gán Source Face hoặc Embedding.\n\n"
+                        "1. Chọn ảnh trong Source Faces (hoặc một embedding).\n"
+                        "2. Click thumbnail nhân vật trong Found Faces để gán.\n"
+                        "3. Bật SwapFaces lại."
+                    )
+                self._tooltip_label.setText("SwapFaces: chưa gán Source Face")
+                QMessageBox.warning(self, "Không thể bật SwapFaces", detail)
+                return
         btn = self._center_pane.buttons.get("SwapFacesButton")
         if btn is not None:
             btn.toggle_button()
