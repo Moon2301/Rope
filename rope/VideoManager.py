@@ -215,6 +215,9 @@ class VideoManager():
         self.auto_segment_ranges = None
         self.auto_render_manifest_path = None
         self.auto_render_active = False
+        # One-shot numerical diagnostic for reports where the model loads
+        # successfully but the preview looks unchanged/garbled.
+        self._swap_diag_done = False
 
         # Benchmark state. `benchmark_mode` is set by
         # play_video('benchmark') and disables audio/wall-clock pacing
@@ -1566,6 +1569,21 @@ class VideoManager():
                         best_sim = sim
                         best_slot = found_face
                 if best_slot is not None:
+                    if not self._swap_diag_done:
+                        try:
+                            src_target_sim = self.findCosineDistance(
+                                best_slot["AssignedEmbedding"], best_slot["Embedding"]
+                            )
+                        except Exception:
+                            src_target_sim = float('nan')
+                        print(
+                            '[swap_diag] matched '
+                            f'frame={frame_number} similarity={best_sim:.2f} '
+                            f'threshold={threshold:.2f} '
+                            f'source_vs_target={src_target_sim:.2f} '
+                            f'assignments={best_slot.get("SourceFaceAssignments")}',
+                            flush=True,
+                        )
                     s_e = best_slot["AssignedEmbedding"]
                     with nvtx_range("swap_core"):
                         img = self.swap_core(img, fface[0], s_e, parameters, control, slot=best_slot)
@@ -1610,6 +1628,12 @@ class VideoManager():
 
     # @profile
     def swap_core(self, img, kps, s_e, parameters, control, precomputed_latent=None, slot=None): # img = RGB
+        diag_this_call = not self._swap_diag_done
+        if diag_this_call:
+            # Mark immediately so concurrent worker frames do not all clone a
+            # full frame and spam diagnostics. This call owns the one report.
+            self._swap_diag_done = True
+            diag_original_frame = img.clone()
         # "512-Native" selects the inswapper_512 model: full 512x512 face
         # crop in a single forward pass, no polyphase decomposition. The
         # numeric modes ('128'/'256'/'512') use the inswapper_128 model
@@ -1797,6 +1821,21 @@ class VideoManager():
                 # fresh tensor, leaving the cached buffer untouched for reuse.
                 swap_face_output = torch.mul(swap_face_output, 255)
                 swap_face_output = torch.clamp(swap_face_output, 0, 255)
+
+        if diag_this_call:
+            diag_input_255 = prev_face * 255.0
+            model_delta = torch.mean(torch.abs(
+                swap_face_output.float() - diag_input_255.float()
+            )).item()
+            finite_ratio = torch.isfinite(swap_face_output).float().mean().item()
+            print(
+                '[swap_diag] model_output '
+                f'min={swap_face_output.min().item():.2f} '
+                f'max={swap_face_output.max().item():.2f} '
+                f'mean_abs_delta={model_delta:.3f} '
+                f'finite={finite_ratio:.4f}',
+                flush=True,
+            )
 
         # ====== High Fidelity 2-pass refinement ==========================
         # Measure the swap output's identity via ArcFace, compute a
@@ -2088,6 +2127,16 @@ class VideoManager():
             img = torch.hstack([pipeline_input_face, swap_mask*255])
             img = img.permute(2,0,1)
 
+        if diag_this_call:
+            frame_delta = torch.mean(torch.abs(
+                img.float() - diag_original_frame.float()
+            )).item()
+            changed = torch.count_nonzero(img != diag_original_frame).item()
+            print(
+                '[swap_diag] final_frame '
+                f'mean_abs_delta={frame_delta:.4f} changed_values={changed}',
+                flush=True,
+            )
         return img
 
     # ------------------------------------------------------------------
