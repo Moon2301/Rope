@@ -534,6 +534,32 @@ class Models():
         # the model wants FP16 — input via .half(), output via a temp
         # FP16 buffer that we copy back into the caller's buffer.
         io_dtype = self._swapper_io_dtype
+
+        # Stable CUDA-EP path for Windows/Ampere. Direct I/O binding hands
+        # ORT raw pointers owned by Torch; on affected driver/ORT builds the
+        # CUDA provider faults inside cudaStreamSynchronize with error 700
+        # even when both sides are explicitly synchronized. Let ORT own the
+        # transfers and allocations instead. The face crop is only
+        # 1x3x128x128 (~192 KiB FP32), so the safety copy is modest compared
+        # with decoding/detection and avoids poisoning the whole CUDA context
+        # (which also causes the subsequent NVDEC failure).
+        if not bool(getattr(self, '_swapper_uses_trt', False)):
+            np_dtype = np.float16 if io_dtype == np.float16 else np.float32
+            target_np = np.ascontiguousarray(
+                image.detach().to('cpu').numpy(), dtype=np_dtype,
+            )
+            source_np = np.ascontiguousarray(
+                embedding.detach().to('cpu').numpy(), dtype=np_dtype,
+            )
+            result_np = swapper_session.run(
+                None, {'target': target_np, 'source': source_np},
+            )[0]
+            result = torch.from_numpy(np.asarray(result_np)).to(
+                device=output.device, dtype=output.dtype,
+            )
+            output.copy_(result)
+            return
+
         if io_dtype == np.float16:
             image_in = image.half() if image.dtype != torch.float16 else image
             embedding_in = embedding.half() if embedding.dtype != torch.float16 else embedding
@@ -562,16 +588,11 @@ class Models():
         # streams refactor; it removes the cross-worker host stall on
         # the global default stream that prior nsys traces showed as
         # the next bottleneck.
-        safe_cuda_boundary = not bool(getattr(self, '_swapper_uses_trt', False))
-        if safe_cuda_boundary:
-            torch.cuda.synchronize()
-        elif self._swapper_should_drain_syncvec():
+        if self._swapper_should_drain_syncvec():
             with nvtx_range("syncvec_drain"):
                 self.syncvec.cpu()
         with nvtx_range("ort_run_swapper"):
             swapper_session.run_with_iobinding(io_binding)
-        if safe_cuda_boundary:
-            torch.cuda.synchronize()
 
         # If we ran in FP16 mode, lift the result back into the
         # caller's FP32 buffer. copy_ handles the dtype conversion.
