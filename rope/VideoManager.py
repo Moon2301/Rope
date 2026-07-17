@@ -214,6 +214,7 @@ class VideoManager():
         self.perf_test = False
         self.auto_segment_ranges = None
         self.auto_render_manifest_path = None
+        self.auto_render_active = False
 
         # Benchmark state. `benchmark_mode` is set by
         # play_video('benchmark') and disables audio/wall-clock pacing
@@ -739,6 +740,7 @@ class VideoManager():
             print('[VideoManager] auto render has no approved segments')
             return
         self.auto_segment_ranges = sorted(cleaned)
+        self.auto_render_active = True
         self.auto_render_manifest_path = self._auto_manifest_for_video()
         self._write_auto_render_manifest({
             'version': 1, 'video': os.path.abspath(self.target_video),
@@ -795,6 +797,7 @@ class VideoManager():
             print('[VideoManager] checkpoint belongs to another video')
             return
         self.auto_segment_ranges = [tuple(item) for item in manifest.get('ranges', [])]
+        self.auto_render_active = True
         self.current_frame = max(0, int(manifest.get('next_frame', 0)))
         if self.current_frame >= self.video_frame_total:
             self._finish_auto_render_parts(manifest)
@@ -856,6 +859,7 @@ class VideoManager():
         except OSError:
             pass
         self.auto_render_manifest_path = None
+        self.auto_render_active = False
         print('[VideoManager] auto render complete:', final_output)
 
 
@@ -1142,6 +1146,7 @@ class VideoManager():
                     self.record = False
                     self.play = False
                     self.auto_segment_ranges = None
+                    self.auto_render_active = False
                     return
                 args =  [ffmpeg_exe,
                         '-hide_banner',
@@ -1361,6 +1366,7 @@ class VideoManager():
                             self._record_auto_render_part(final_file, last_recorded_frame)
                         self.record = False
                         self.auto_segment_ranges = None
+                        self.auto_render_active = False
                         print('Video saved as:', final_file)
                         msg = "Total time: %s s." % (round(timef,1))
                         print(msg)
@@ -1387,8 +1393,12 @@ class VideoManager():
             print(f'[thread_video_read] first frame: type={kind}{extra} gpu_decode_active={gpu}')
             self._dbg_logged_input = True
         ranges = self.auto_segment_ranges
-        in_auto_range = ranges is None or any(
-            start <= frame_number <= end for start, end in ranges
+        # Segment gating is a batch-record concern only. Never let stale
+        # checkpoint/range state disable ordinary preview or manual record.
+        in_auto_range = (
+            not self.auto_render_active
+            or ranges is None
+            or any(start <= frame_number <= end for start, end in ranges)
         )
         if not self.control['SwapFacesButton'] or not in_auto_range:
             # Pass the decoder output through untouched — the Qt preview
