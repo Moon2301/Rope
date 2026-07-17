@@ -84,6 +84,7 @@ class CenterPane(QFrame):
     clear_faces_pressed = Signal()
     toggle_swap_faces = Signal()
     preload_pressed = Signal()
+    auto_segments_pressed = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -266,6 +267,11 @@ class CenterPane(QFrame):
         find_btn.clicked.connect(lambda *_: self.find_faces_pressed.emit())
         self.buttons["FindFacesButton"] = find_btn
         header.addWidget(find_btn)
+
+        auto_btn = QPushButton("Auto Segments")
+        auto_btn.clicked.connect(lambda *_: self.auto_segments_pressed.emit())
+        self.buttons["AutoSegmentsButton"] = auto_btn
+        header.addWidget(auto_btn)
 
         clear_btn = QPushButton("Clear Faces")
         clear_btn.clicked.connect(lambda *_: self.clear_faces_pressed.emit())

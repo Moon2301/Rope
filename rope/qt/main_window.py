@@ -18,11 +18,12 @@ from typing import Any, Optional
 
 import os
 import time
+import threading
 from typing import Any
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, QStandardPaths, Qt, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -52,6 +53,11 @@ from rope.qt.widgets.embedding_merge_dialog import (
 )
 from rope.qt.widgets.text import Text
 from rope.qt.widgets.vram_indicator import VRAMIndicator
+from rope.AutoSegments import (
+    approved_ranges, group_matches, load_scan_cache, save_scan_cache,
+    scan_cache_key,
+)
+from rope.qt.widgets.auto_segments_dialog import AutoSegmentsDialog
 
 
 SAVED_PARAMETERS_JSON = "saved_parameters.json"
@@ -94,6 +100,103 @@ def _cosine_similarity_pct(v1: np.ndarray, v2: np.ndarray) -> float:
         return 0.0
     cos_dist = 1.0 - float(np.dot(v1, v2)) / float(denom)
     return 100.0 - cos_dist * 50.0
+
+
+class _AutoScanSignals(QObject):
+    progress = Signal(int, int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+
+class _AutoScanWorker(QRunnable):
+    def __init__(self, vm, target_embedding, threshold, stride, gap, padding,
+                 cache_dir, cancel_event):
+        super().__init__()
+        self.vm = vm
+        self.target = np.asarray(target_embedding, dtype=np.float32)
+        self.threshold = float(threshold)
+        self.stride = int(stride)
+        self.gap = int(gap)
+        self.padding = int(padding)
+        self.cache_dir = cache_dir
+        self.cancel_event = cancel_event
+        self.signals = _AutoScanSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            import torch
+            player = self.vm.player
+            params = dict(self.vm.parameters)
+            total_frames = int(self.vm.video_frame_total)
+            config = {
+                'threshold': self.threshold, 'stride': self.stride,
+                'gap': self.gap, 'padding': self.padding,
+                'detector': str(params.get('DetectTypeTextSel', 'Retinaface')),
+                'detect_score': float(params.get('DetectScoreSlider', 50)),
+                'input_size': int(params.get('DetectInputSizeTextSel', 640)),
+            }
+            key = scan_cache_key(self.vm.target_video, self.target, config)
+            segments = load_scan_cache(self.cache_dir, key)
+            cached = segments is not None
+            sample_frames = list(range(0, total_frames, max(1, self.stride)))
+            matches = []
+            if segments is None:
+                for index, frame_no in enumerate(sample_frames, 1):
+                    if self.cancel_event.is_set():
+                        self.signals.failed.emit("Đã hủy scan.")
+                        return
+                    frame, _pts = player.get_frame_at(frame_no)
+                    if isinstance(frame, torch.Tensor):
+                        image = frame.to(device='cuda', dtype=torch.uint8)
+                    else:
+                        image = torch.from_numpy(np.asarray(frame, dtype=np.uint8)).to('cuda')
+                    image = image.permute(2, 0, 1)
+                    kpss = self.vm.models.run_detect(
+                        image, config['detector'], max_num=20,
+                        score=config['detect_score'] / 100.0,
+                        input_size=config['input_size'],
+                    )
+                    best = 0.0
+                    for kps in kpss:
+                        embedding, _crop = self.vm.models.run_recognize(image, kps)
+                        best = max(best, _cosine_similarity_pct(embedding, self.target))
+                    if best >= self.threshold:
+                        matches.append((frame_no, best))
+                    self.signals.progress.emit(index, len(sample_frames))
+                segments = group_matches(
+                    matches, stride=self.stride, gap_frames=self.gap,
+                    padding_frames=self.padding, total_frames=total_frames,
+                )
+                save_scan_cache(self.cache_dir, key, segments)
+
+            thumbnails = {}
+            for row, segment in enumerate(segments):
+                if self.cancel_event.is_set():
+                    self.signals.failed.emit("Đã hủy scan.")
+                    return
+                points = {
+                    'start': segment.start_frame,
+                    'middle': (segment.start_frame + segment.end_frame) // 2,
+                    'end': segment.end_frame,
+                }
+                thumbnails[row] = {}
+                for name, frame_no in points.items():
+                    frame, _pts = player.get_frame_at(frame_no)
+                    if isinstance(frame, torch.Tensor):
+                        frame = frame.cpu().numpy()
+                    frame = np.ascontiguousarray(frame)
+                    h, w = frame.shape[:2]
+                    scale = min(96 / max(1, w), 64 / max(1, h))
+                    thumbnails[row][name] = cv2.resize(
+                        frame, (max(1, int(w * scale)), max(1, int(h * scale))),
+                        interpolation=cv2.INTER_AREA,
+                    )
+            self.signals.finished.emit({
+                'segments': segments, 'thumbnails': thumbnails, 'cached': cached,
+            })
+        except Exception as exc:
+            self.signals.failed.emit(f"Quét thất bại: {exc}")
 
 
 class MainWindow(QMainWindow):
@@ -464,11 +567,116 @@ class MainWindow(QMainWindow):
         cp.preview_mode_changed.connect(self._on_preview_mode_changed)
         cp.save_image.connect(self._on_save_image)
         cp.preload_pressed.connect(self._on_preload_models)
+        cp.auto_segments_pressed.connect(self._open_auto_segments)
 
         # Reflect VM-emitted slider length back into the timeline.
         bus.slider_length_changed.connect(cp.timeline.set_length)
         # Preload build finished → settle the Preload Models button.
         bus.models_preloaded.connect(self._on_models_preloaded)
+
+    def _open_auto_segments(self) -> None:
+        if not getattr(getattr(self, '_coordinator', None), 'vm', None):
+            QMessageBox.warning(self, "Auto Segments", "Backend video chưa sẵn sàng.")
+            return
+        if not self._found_faces:
+            QMessageBox.information(
+                self, "Auto Segments",
+                "Hãy mở một frame có nhân vật và bấm Find Faces trước.",
+            )
+            return
+        gallery = self._center_pane.found_faces_gallery
+        selected_getter = getattr(gallery, 'selected_index', None)
+        selected = selected_getter() if callable(selected_getter) else -1
+        if not isinstance(selected, int) or not (0 <= selected < len(self._found_faces)):
+            selected = 0
+        self._auto_target_index = selected
+        dialog = AutoSegmentsDialog(self)
+        dialog.scan_requested.connect(self._start_auto_scan)
+        dialog.render_requested.connect(self._start_auto_render)
+        dialog.seek_requested.connect(self._seek_to_frame)
+        dialog.cancel_scan_requested.connect(self._cancel_auto_scan)
+        dialog.cancel_render_requested.connect(self._cancel_auto_render)
+        dialog.resume_render_requested.connect(self._resume_auto_render)
+        self._center_pane.timeline.position_changed.connect(dialog.set_playhead)
+        self._auto_segments_dialog = dialog
+        dialog.show()
+
+    def _start_auto_scan(self, stride: int, gap: int, padding: int) -> None:
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if vm is None or dialog is None or not getattr(vm, 'is_video_loaded', False):
+            if dialog is not None:
+                dialog.set_error("Hãy tải video trước khi quét.")
+            return
+        if self._is_playing or self._is_recording:
+            bus.play_video.emit('stop_from_gui')
+            self._is_playing = self._is_recording = False
+        slot = self._found_faces[self._auto_target_index]
+        if not slot.get('SourceFaceAssignments') or slot.get('AssignedEmbedding') is None:
+            dialog.set_error("Hãy gán source face/embedding cho nhân vật trước khi quét.")
+            return
+        threshold = float(self._params_pane.values.get('ThresholdSlider', 55))
+        self._auto_scan_cancel = threading.Event()
+        cache_dir = os.path.join(QStandardPaths.writableLocation(QStandardPaths.CacheLocation),
+                                 'auto_segments')
+        worker = _AutoScanWorker(
+            vm, slot['Embedding'], threshold, stride, gap, padding,
+            cache_dir, self._auto_scan_cancel,
+        )
+        worker.signals.progress.connect(dialog.set_progress)
+        worker.signals.finished.connect(self._on_auto_scan_finished)
+        worker.signals.failed.connect(dialog.set_error)
+        self._auto_scan_worker = worker
+        QThreadPool.globalInstance().start(worker)
+
+    def _cancel_auto_scan(self) -> None:
+        event = getattr(self, '_auto_scan_cancel', None)
+        if event is not None:
+            event.set()
+
+    def _on_auto_scan_finished(self, result) -> None:
+        segments = result['segments']
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_segments(segments, result.get('thumbnails'), cached=result.get('cached', False))
+        self._center_pane.timeline.set_segments([item.to_dict() for item in segments])
+
+    def _start_auto_render(self, segments) -> None:
+        ranges = approved_ranges(segments)
+        if not ranges:
+            return
+        if not self.settings.saved_videos:
+            QMessageBox.warning(self, "Auto Segments", "Hãy chọn Output folder trước.")
+            return
+        self._center_pane.timeline.set_segments([item.to_dict() for item in segments])
+        bus.auto_render_segments.emit(ranges)
+        self._is_playing = True
+        self._is_recording = True
+        self._center_pane.set_play_state(True)
+        self._center_pane.set_record_state(True)
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.status.setText("Đang render… Có thể bấm Hủy render để lưu checkpoint.")
+
+    def _cancel_auto_render(self) -> None:
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        if vm is not None:
+            vm.cancel_auto_segment_render()
+            dialog = getattr(self, '_auto_segments_dialog', None)
+            if dialog is not None:
+                dialog.status.setText("Đang đóng part hiện tại và lưu checkpoint…")
+
+    def _resume_auto_render(self) -> None:
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        if vm is not None:
+            vm.resume_auto_segment_render()
+            self._is_playing = True
+            self._is_recording = True
+            self._center_pane.set_play_state(True)
+            self._center_pane.set_record_state(True)
+            dialog = getattr(self, '_auto_segments_dialog', None)
+            if dialog is not None:
+                dialog.status.setText("Đang tiếp tục render từ checkpoint…")
 
     def _on_play_pressed(self) -> None:
         # The preview canvas is wired to this handler too, so clicking the

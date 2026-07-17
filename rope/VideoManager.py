@@ -11,6 +11,8 @@ from skimage import transform as trans
 import subprocess
 from math import floor, ceil
 import bisect
+import json
+import hashlib
 
 from rope.qt.bus import bus
 from rope._nvtx import nvtx_range
@@ -210,6 +212,8 @@ class VideoManager():
         self.is_image_loaded = False
         self.stop_marker = -1
         self.perf_test = False
+        self.auto_segment_ranges = None
+        self.auto_render_manifest_path = None
 
         # Benchmark state. `benchmark_mode` is set by
         # play_video('benchmark') and disables audio/wall-clock pacing
@@ -718,6 +722,142 @@ class VideoManager():
     def assign_found_faces(self, found_faces):
         self.found_faces = found_faces
 
+    def start_auto_segment_render(self, ranges):
+        """Record once from frame zero, swapping only inclusive ranges."""
+        if not self.is_video_loaded or self.player is None:
+            print('[VideoManager] auto render requires a loaded video')
+            return
+        cleaned = []
+        for item in ranges or []:
+            try:
+                start, end = int(item[0]), int(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if end >= start:
+                cleaned.append((max(0, start), min(self.video_frame_total - 1, end)))
+        if not cleaned:
+            print('[VideoManager] auto render has no approved segments')
+            return
+        self.auto_segment_ranges = sorted(cleaned)
+        self.auto_render_manifest_path = self._auto_manifest_for_video()
+        self._write_auto_render_manifest({
+            'version': 1, 'video': os.path.abspath(self.target_video),
+            'ranges': self.auto_segment_ranges, 'parts': [], 'next_frame': 0,
+        })
+        self.current_frame = 0
+        self.control['SwapFacesButton'] = True
+        self.play_video('record')
+
+    def _auto_manifest_for_video(self):
+        stem = os.path.splitext(os.path.basename(self.target_video))[0]
+        key = hashlib.sha1(os.path.abspath(self.target_video).encode(
+            'utf-8', 'surrogatepass')).hexdigest()[:10]
+        return os.path.join(
+            self.saved_video_path, f'.{stem}_{key}_auto_render.json')
+
+    def _write_auto_render_manifest(self, data):
+        path = self.auto_render_manifest_path
+        if not path:
+            return
+        temp = path + '.tmp'
+        try:
+            with open(temp, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+            os.replace(temp, path)
+        except OSError as exc:
+            print('[VideoManager] could not save auto-render checkpoint:', exc)
+
+    def _read_auto_render_manifest(self):
+        path = self.auto_render_manifest_path
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return None
+
+    def cancel_auto_segment_render(self):
+        """Request a graceful stop; process() finalizes the current part."""
+        if self.record and self.auto_render_manifest_path:
+            self.play = False
+            if self.player is not None:
+                self.player.stop_playback()
+
+    def resume_auto_segment_render(self):
+        if not self.auto_render_manifest_path:
+            self.auto_render_manifest_path = self._auto_manifest_for_video()
+        manifest = self._read_auto_render_manifest()
+        if manifest is None:
+            print('[VideoManager] no auto-render checkpoint to resume')
+            return
+        if os.path.abspath(self.target_video) != manifest.get('video'):
+            print('[VideoManager] checkpoint belongs to another video')
+            return
+        self.auto_segment_ranges = [tuple(item) for item in manifest.get('ranges', [])]
+        self.current_frame = max(0, int(manifest.get('next_frame', 0)))
+        if self.current_frame >= self.video_frame_total:
+            self._finish_auto_render_parts(manifest)
+            return
+        self.control['SwapFacesButton'] = True
+        self.play_video('record')
+
+    def _record_auto_render_part(self, final_file, last_frame):
+        manifest = self._read_auto_render_manifest()
+        if manifest is None:
+            return
+        parts = list(manifest.get('parts', []))
+        parts.append(os.path.abspath(final_file))
+        manifest['parts'] = parts
+        manifest['next_frame'] = int(last_frame) + 1
+        self._write_auto_render_manifest(manifest)
+        if manifest['next_frame'] >= self.video_frame_total:
+            self._finish_auto_render_parts(manifest)
+
+    def _finish_auto_render_parts(self, manifest):
+        parts = [path for path in manifest.get('parts', []) if os.path.isfile(path)]
+        if not parts:
+            return
+        if len(parts) == 1:
+            final_output = parts[0]
+        else:
+            ffmpeg_exe = _find_ffmpeg()
+            if ffmpeg_exe is None:
+                print('[VideoManager] ffmpeg required to join resumed render parts')
+                return
+            ext = os.path.splitext(parts[0])[1]
+            final_output = os.path.splitext(parts[0])[0] + '_resumed' + ext
+            concat_file = self.auto_render_manifest_path + '.concat.txt'
+            try:
+                with open(concat_file, 'w', encoding='utf-8') as handle:
+                    for path in parts:
+                        escaped = path.replace("'", "'\\''")
+                        handle.write(f"file '{escaped}'\n")
+                result = subprocess.run([
+                    ffmpeg_exe, '-hide_banner', '-loglevel', 'error',
+                    '-f', 'concat', '-safe', '0', '-i', concat_file,
+                    '-c', 'copy', final_output,
+                ])
+                if result.returncode != 0:
+                    print('[VideoManager] failed to concatenate resumed parts')
+                    return
+            finally:
+                try:
+                    os.remove(concat_file)
+                except OSError:
+                    pass
+            for path in parts:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        try:
+            os.remove(self.auto_render_manifest_path)
+        except OSError:
+            pass
+        self.auto_render_manifest_path = None
+        print('[VideoManager] auto render complete:', final_output)
+
 
     def load_target_video( self, file ):
         # If we already have a player open, release it cleanly.
@@ -1001,6 +1141,7 @@ class VideoManager():
                           'and restart, or switch RecordType to OPENCV.')
                     self.record = False
                     self.play = False
+                    self.auto_segment_ranges = None
                     return
                 args =  [ffmpeg_exe,
                         '-hide_banner',
@@ -1216,7 +1357,10 @@ class VideoManager():
                                 pass
 
                         timef= time.time() - self.timer 
+                        if self.auto_render_manifest_path:
+                            self._record_auto_render_part(final_file, last_recorded_frame)
                         self.record = False
+                        self.auto_segment_ranges = None
                         print('Video saved as:', final_file)
                         msg = "Total time: %s s." % (round(timef,1))
                         print(msg)
@@ -1242,7 +1386,11 @@ class VideoManager():
             gpu = getattr(self.player, 'gpu_decode_active', '?') if self.player is not None else '?'
             print(f'[thread_video_read] first frame: type={kind}{extra} gpu_decode_active={gpu}')
             self._dbg_logged_input = True
-        if not self.control['SwapFacesButton']:
+        ranges = self.auto_segment_ranges
+        in_auto_range = ranges is None or any(
+            start <= frame_number <= end for start, end in ranges
+        )
+        if not self.control['SwapFacesButton'] or not in_auto_range:
             # Pass the decoder output through untouched — the Qt preview
             # handles both CUDA HxWx3 uint8 tensors (fast path) and numpy
             # (CPU fallback). Avoid the GPU->CPU bounce that would force

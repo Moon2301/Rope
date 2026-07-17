@@ -19,6 +19,7 @@ class Bus(QObject):
     set_stop = Signal(int)
     perf_test = Signal(bool)
     auto_swap = Signal()
+    auto_render_segments = Signal(object)
 
     # VideoManager -> GUI
     frame_ready = Signal(object, bool)

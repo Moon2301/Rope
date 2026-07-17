@@ -22,6 +22,8 @@ _TROUGH_COLOR = QColor("#43474D")
 _PLAYHEAD_COLOR = QColor("#FFFFFF")
 _MARKER_COLOR = QColor("light goldenrod")
 _BG_COLOR = QColor("#212126")
+_APPROVED_SEGMENT_COLOR = QColor("#3F7D55")
+_REJECTED_SEGMENT_COLOR = QColor("#734147")
 
 _SLIDER_PAD_LEFT = 20
 _SLIDER_PAD_RIGHT = 20
@@ -39,6 +41,7 @@ class Timeline(QWidget):
         self._max = 100
         self._position = 0
         self._markers: list[int] = []
+        self._segments: list[dict] = []
         self._dragging = False
 
         self.setMinimumHeight(28)
@@ -94,6 +97,15 @@ class Timeline(QWidget):
         # Trough
         trough = self._trough_rect()
         painter.fillRect(trough, _TROUGH_COLOR)
+
+        if self._segments and self._max > 0:
+            for segment in self._segments:
+                start = self._pos_to_coord(int(segment.get("start_frame", 0)))
+                end = self._pos_to_coord(int(segment.get("end_frame", 0)))
+                color = (_APPROVED_SEGMENT_COLOR if segment.get("approved", True)
+                         else _REJECTED_SEGMENT_COLOR)
+                painter.fillRect(QRect(start, self.height() // 2 - 4,
+                                       max(2, end - start + 1), 8), color)
 
         # Markers (vertical ticks above + below trough centerline)
         if self._markers and self._max > 0:
@@ -188,6 +200,10 @@ class Timeline(QWidget):
 
     def set_markers(self, frames: list[int]) -> None:
         self._markers = [int(f) for f in frames]
+        self.update()
+
+    def set_segments(self, segments: list[dict]) -> None:
+        self._segments = [dict(item) for item in segments]
         self.update()
 
     def add_info_frame(self, _info) -> None:

@@ -19,6 +19,15 @@ Rope implements the insightface inswapper_128 model with a helpful GUI.
 * Easier Embedding management. Drag and drop embeddings to reorder them.
 * New Capture mode. Move and resize a window on your desktop to swap whatever is in it.
 
+### Auto Character Segments
+
+1. Load a video, seek to the character, click **Find Faces**, then assign a source face or embedding.
+2. Click **Auto Segments** and scan. Results are cached by video, target face, and scan settings.
+3. Review the start/middle/end thumbnails. Approve, reject, edit frame bounds, split at the playhead, or merge selected rows.
+4. Render approved ranges. Frames outside those ranges pass through unchanged.
+
+**Cancel scan** stops after the current model call. **Cancel render** safely closes the current part and writes a checkpoint. Open Auto Segments again and click **Continue render** to resume from the next frame; completed parts are concatenated automatically at the end.
+
 ### Install from scratch:
 ```cmd
 py -3.12 -m venv venv
