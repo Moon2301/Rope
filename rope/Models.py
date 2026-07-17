@@ -184,9 +184,16 @@ class Models():
         # auto (current behavior — prefer TRT if engine present).
         # Driven by the Settings-tab Backend toggle and applied at the
         # next lazy load.
-        # Inswapper starts on CUDA EP for reliability. A persisted/user
-        # preference of "trt" still overrides this default.
-        self._backend_pref: dict = {'swapper_model': 'onnx'}
+        # Reliability-first defaults for Windows/Ampere systems. ORT-TRT
+        # sessions can build successfully yet hang on the first RetinaFace/
+        # ArcFace inference or fault in inswapper. CUDA EP is the default for
+        # the core pipeline; a persisted/user "trt" preference still opts a
+        # model back into TensorRT explicitly.
+        self._backend_pref: dict = {
+            'retinaface_model': 'onnx',
+            'recognition_model': 'onnx',
+            'swapper_model': 'onnx',
+        }
         self.syncvec = torch.empty((1,1), dtype=torch.float32, device='cuda:0')
 
         # Model session mode — controls every ORT-TRT-EP session the
