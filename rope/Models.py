@@ -225,6 +225,12 @@ class Models():
         """Resolve a model filename against the configured folder."""
         return os.path.join(self.models_folder, name)
 
+    def _swapper_128_filename(self):
+        """Prefer the original FP32 model over third-party FP16 conversions."""
+        if os.path.exists(self._mp('inswapper_128.onnx')):
+            return 'inswapper_128.onnx'
+        return 'inswapper_128.fp16.onnx'
+
     def set_models_folder(self, path):
         """Point all model lookups at a new folder. Falsy = revert to
         default. Drops every loaded model so the next inference call
@@ -464,7 +470,8 @@ class Models():
         # FP32 and FP16 exports), and fall back to "the (512, 512)
         # initializer" for robustness against future renames.
         if getattr(self, 'emap', None) is None or len(self.emap) == 0:
-            graph = onnx.load(self._mp("inswapper_128.fp16.onnx")).graph
+            swapper_file = self._swapper_128_filename()
+            graph = onnx.load(self._mp(swapper_file)).graph
             emap_arr = None
             for init in graph.initializer:
                 if init.name == 'buff2fs':
@@ -478,7 +485,7 @@ class Models():
                         break
             if emap_arr is None:
                 raise RuntimeError(
-                    "emap (512x512) not found in inswapper_128.fp16.onnx"
+                    f"emap (512x512) not found in {swapper_file}"
                 )
             # FP16 ONNX stores the emap in float16; promote to float32
             # so the downstream np.dot stays in FP32 for numerical safety.
@@ -901,7 +908,7 @@ class Models():
         # that does not depend on deleting/versioning an engine cache.
         want_trt = pref == 'trt'
 
-        onnx_path = self._mp("inswapper_128.fp16.onnx")
+        onnx_path = self._mp(self._swapper_128_filename())
         sess = None
 
         if want_trt:
@@ -1029,7 +1036,11 @@ class Models():
             self._swapper_batch_unsupported = False
         backend = 'TensorrtExecutionProvider' if self._swapper_uses_trt else 'CUDAExecutionProvider'
         batch_note = ' static-batch=1' if self._swapper_batch_unsupported else ''
-        print(f'{self._load_tag("swap")} [Models] inswapper: {backend} (io={self._swapper_io_dtype.__name__}{batch_note})')
+        print(
+            f'{self._load_tag("swap")} [Models] inswapper: {backend} '
+            f'(file={os.path.basename(onnx_path)} '
+            f'io={self._swapper_io_dtype.__name__}{batch_note})'
+        )
         return sess
 
     # ===== Generic per-thread session dispatcher ==========================
@@ -1275,7 +1286,7 @@ class Models():
     def _swapper_preload_for(self, swapper_type):
         if str(swapper_type) == '256-Native':
             return self._SWAPPER_PRELOAD_NATIVE256
-        return self._SWAPPER_PRELOAD_128
+        return (self._swapper_128_filename(), '_get_swapper_session')
 
     def _pipeline_preload_set(self, swapper_type='128', detect_mode='Retinaface'):
         """(filename, getter) triples to preload for the given detector +
@@ -1367,7 +1378,7 @@ class Models():
                 except Exception as e:
                     print(f'[Models.preload_pipeline_sessions] swapper_256 warm-up: '
                           f'{type(e).__name__}: {e}')
-        elif os.path.exists(self._mp('inswapper_128.fp16.onnx')):
+        elif os.path.exists(self._mp(self._swapper_128_filename())):
             try:
                 z_img = torch.zeros((1, 3, 128, 128), dtype=torch.float32, device='cuda')
                 z_emb = torch.zeros((1, 512), dtype=torch.float32, device='cuda')
