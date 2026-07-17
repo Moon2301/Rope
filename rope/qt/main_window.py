@@ -1021,13 +1021,44 @@ class MainWindow(QMainWindow):
             del idx  # tile index matches list index by construction
 
     def _on_found_face_clicked(self, index: int) -> None:
-        """Select-only: highlight this Found Face as the current target
-        slot. Subsequent source-face / embedding picks apply to it.
-        Doesn't apply anything by itself."""
+        """Select a target slot and apply any already-selected source.
+
+        Both natural interaction orders must work:
+        ``Found Face -> Source Face`` is handled by the source selection
+        callback, while ``Source Face -> Found Face`` is handled here.
+        Previously the latter only changed highlights, leaving the slot
+        unassigned even though both tiles visibly looked selected.
+        """
         if not (0 <= index < len(self._found_faces)):
             return
         self._center_pane.found_faces_gallery.set_selected(index)
         slot = self._found_faces[index]
+
+        # If a source or saved embedding was selected first, assign it now.
+        if self._active_merged_embedding is not None:
+            name, embedding = self._active_merged_embedding
+            self._apply_to_selected_slot(
+                embedding, [f"emb:{name}"], label=f"Embedding '{name}'",
+            )
+            return
+        usable = [
+            path for path in self._selected_source_paths
+            if path in self._source_face_embeddings
+        ]
+        if usable:
+            embeddings = [self._source_face_embeddings[path] for path in usable]
+            mode = str(self._params_pane.values.get("MergeTextSel", "Mean"))
+            try:
+                from rope.EmbeddingMerge import combine
+                merged = combine(embeddings, mode)
+            except Exception:
+                merged = np.mean(np.stack(embeddings, axis=0), axis=0)
+            self._apply_to_selected_slot(
+                merged, usable,
+                label=f"{len(usable)} source face(s) ({mode})",
+            )
+            return
+
         assigned = slot.get("SourceFaceAssignments") or []
         # Push the assignment back to the source/embedding panels so
         # they tint the contributing items in gold. Tags use the same
