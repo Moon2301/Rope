@@ -19,19 +19,33 @@ Rope implements the insightface inswapper_128 model with a helpful GUI.
 * Easier Embedding management. Drag and drop embeddings to reorder them.
 * New Capture mode. Move and resize a window on your desktop to swap whatever is in it.
 
-### Auto Character Segments
+### Single-character Auto Job
 
-1. Load a video, seek to the character, click **Find Faces**, then assign a source face or embedding.
-2. Click **Auto Segments** and scan. Results are cached by video, target face, and scan settings.
-3. Review the start/middle/end thumbnails. Approve, reject, edit frame bounds, split at the playhead, or merge selected rows.
-4. Render approved ranges. Frames outside those ranges pass through unchanged.
+1. Load a video, seek to the character, click **Find Faces**, and assign one source face or embedding.
+2. Click **Start Auto Job**. Preflight checks the input, models, FFmpeg, output folder, free space, and face assignment before any GPU work starts.
+3. The job scans or resumes its cache, then always stops at **AWAITING_REVIEW**. Review the start/middle/end thumbnails, warnings, frame bounds, split/merge edits, and selected swap duration.
+4. Click **Confirm & Render**. There is no code path from scan to render without this explicit confirmation.
+5. Rope renders minute-long video-only parts, joins them, muxes the original audio once, and runs output QC. Use **Open Output** after the job reaches **COMPLETED**.
 
-**Cancel scan** stops after the current model call. **Cancel render** safely closes the current part and writes a checkpoint. Open Auto Segments again and click **Continue render** to resume from the next frame; completed parts are concatenated automatically at the end.
+Auto Jobs persist under the application-data directory. Scan progress is
+checkpointed inside each five-minute chunk every 100 model calls or ten
+seconds. Render checkpoints are finalized every 60 seconds, so a cancel,
+crash, or application restart only repeats the unfinished scan block or render
+part. Open **Resume Auto Job** to continue.
 
-Long videos are scanned sequentially in five-minute chunks. The default
-0.5-second coarse pass is refined every three frames around matches and
-near-matches. Completed chunks are cached, so pressing Scan again after a
-cancel or restart resumes without rescanning finished chunks.
+Long-video scanning keeps the sensitive 0.5-second coarse pass and refines
+every three frames within one second of hits and near-hits. Cache keys include
+the video fingerprint, target embedding, detector settings, threshold, and
+algorithm version. Borderline, sub-0.7-second, and single-hit ranges are marked
+for extra review.
+
+Auto rendering writes RGB frames directly to FFmpeg instead of wrapping every
+frame as a BMP. A real one-frame probe selects `h264_nvenc` when it works and
+falls back to `libx264`; a live NVENC failure retries the current part with
+x264. Frames outside approved ranges are passed through without face detection
+or swapping. QC verifies readable output, resolution, FPS, frame count, audio,
+sampled black frames, and sampled source-identity similarity. Temporary parts
+are removed only after QC succeeds.
 
 ### Install from scratch:
 ```cmd

@@ -19,6 +19,7 @@ from rope._nvtx import nvtx_range
 
 
 _FFMPEG_PATH_CACHE = None
+_FFMPEG_NVENC_CACHE = {}
 
 
 def _find_ffmpeg():
@@ -60,6 +61,26 @@ def _find_ffmpeg():
     except Exception:
         pass
     return None
+
+
+def _ffmpeg_has_working_nvenc(ffmpeg_exe):
+    """Probe the actual driver/encoder path, not merely `-encoders` output."""
+    if not ffmpeg_exe:
+        return False
+    key = os.path.abspath(ffmpeg_exe)
+    if key in _FFMPEG_NVENC_CACHE:
+        return _FFMPEG_NVENC_CACHE[key]
+    try:
+        result = subprocess.run([
+            ffmpeg_exe, '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'color=size=64x64:rate=1:color=black',
+            '-frames:v', '1', '-an', '-c:v', 'h264_nvenc', '-f', 'null', '-',
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        value = result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        value = False
+    _FFMPEG_NVENC_CACHE[key] = value
+    return value
 import onnxruntime
 import torchvision
 from torchvision.transforms.functional import normalize #update to v2
@@ -215,6 +236,13 @@ class VideoManager():
         self.auto_segment_ranges = None
         self.auto_render_manifest_path = None
         self.auto_render_active = False
+        self.auto_render_cancel_requested = False
+        self.auto_render_part_end = None
+        self.auto_current_part_final = None
+        self.auto_current_part_temp = None
+        self.auto_render_started_at = None
+        self.auto_render_last_progress_frame = -1
+        self.auto_render_parameters = None
         # One-shot numerical diagnostic for reports where the model loads
         # successfully but the preview looks unchanged/garbled.
         self._swap_diag_done = False
@@ -726,13 +754,18 @@ class VideoManager():
     def assign_found_faces(self, found_faces):
         self.found_faces = found_faces
 
-    def start_auto_segment_render(self, ranges):
-        """Record once from frame zero, swapping only inclusive ranges."""
+    def start_auto_segment_render(self, request):
+        """Start a persistent, minute-part Auto Job render.
+
+        The input timeline is never physically split.  Every output frame is
+        written, while expensive face work is gated to approved ranges.
+        """
         if not self.is_video_loaded or self.player is None:
-            print('[VideoManager] auto render requires a loaded video')
+            bus.auto_render_failed.emit('Auto render requires a loaded video')
             return
+        payload = request if isinstance(request, dict) else {'ranges': request}
         cleaned = []
-        for item in ranges or []:
+        for item in payload.get('ranges') or []:
             try:
                 start, end = int(item[0]), int(item[1])
             except (TypeError, ValueError, IndexError):
@@ -740,23 +773,56 @@ class VideoManager():
             if end >= start:
                 cleaned.append((max(0, start), min(self.video_frame_total - 1, end)))
         if not cleaned:
-            print('[VideoManager] auto render has no approved segments')
+            bus.auto_render_failed.emit('Auto render has no approved segments')
             return
+        ffmpeg_exe = _find_ffmpeg()
+        if ffmpeg_exe is None:
+            bus.auto_render_failed.emit('FFmpeg is required for Auto Job render')
+            return
+        job_id = str(payload.get('job_id') or hashlib.sha1(
+            f'{self.target_video}|{time.time()}'.encode()).hexdigest()[:12])
+        source_label = ''.join(
+            ch if ch.isalnum() or ch in '-_' else '_'
+            for ch in str(payload.get('source_label') or 'source')
+        ).strip('_') or 'source'
+        stem = os.path.splitext(os.path.basename(self.target_video))[0]
+        safe_stem = ''.join(ch if ch.isalnum() or ch in '-_' else '_'
+                            for ch in stem).strip('_') or 'video'
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        work_dir = os.path.join(self.saved_video_path, f'.rope_{safe_stem}_{job_id}.parts')
+        os.makedirs(work_dir, exist_ok=True)
+        final_output = os.path.join(
+            self.saved_video_path,
+            f'{safe_stem}_{source_label}_autoswap_{stamp}.mp4',
+        )
         self.auto_segment_ranges = sorted(cleaned)
         self.auto_render_active = True
-        self.auto_render_manifest_path = self._auto_manifest_for_video()
+        self.auto_render_cancel_requested = False
+        self.auto_render_parameters = dict(payload.get('render_params') or self.parameters)
+        self.auto_render_manifest_path = self._auto_manifest_for_video(job_id)
+        part_frames = max(1, int(round(
+            float(self.fps) * max(10, int(payload.get('part_seconds', 60)))
+        )))
+        stat = os.stat(self.target_video)
         self._write_auto_render_manifest({
-            'version': 1, 'video': os.path.abspath(self.target_video),
+            'version': 2, 'job_id': job_id,
+            'video': os.path.abspath(self.target_video),
+            'video_size': int(stat.st_size), 'video_mtime_ns': int(stat.st_mtime_ns),
             'ranges': self.auto_segment_ranges, 'parts': [], 'next_frame': 0,
+            'part_frames': part_frames, 'work_dir': work_dir,
+            'final_output': final_output, 'stage': 'RENDERING',
+            'encoder': 'h264_nvenc' if _ffmpeg_has_working_nvenc(ffmpeg_exe) else 'libx264',
+            'render_params': self.auto_render_parameters,
         })
-        self.current_frame = 0
+        self.auto_render_started_at = time.perf_counter()
+        self.auto_render_last_progress_frame = -1
         self.control['SwapFacesButton'] = True
-        self.play_video('record')
+        self._start_auto_render_part(self._read_auto_render_manifest())
 
-    def _auto_manifest_for_video(self):
+    def _auto_manifest_for_video(self, job_id=None):
         stem = os.path.splitext(os.path.basename(self.target_video))[0]
-        key = hashlib.sha1(os.path.abspath(self.target_video).encode(
-            'utf-8', 'surrogatepass')).hexdigest()[:10]
+        key = str(job_id or hashlib.sha1(os.path.abspath(self.target_video).encode(
+            'utf-8', 'surrogatepass')).hexdigest()[:10])
         return os.path.join(
             self.saved_video_path, f'.{stem}_{key}_auto_render.json')
 
@@ -785,85 +851,201 @@ class VideoManager():
     def cancel_auto_segment_render(self):
         """Request a graceful stop; process() finalizes the current part."""
         if self.record and self.auto_render_manifest_path:
+            self.auto_render_cancel_requested = True
             self.play = False
             if self.player is not None:
                 self.player.stop_playback()
+            if not any(
+                item.get('Status') in ('started', 'finished')
+                for item in self.process_qs
+            ):
+                try:
+                    self.sp.stdin.close()
+                    self.sp.wait(timeout=10)
+                except Exception:
+                    pass
+                self.record = False
+                self.auto_render_active = False
+                manifest = self._read_auto_render_manifest() or {}
+                manifest['stage'] = 'PAUSED'
+                self._write_auto_render_manifest(manifest)
+                bus.auto_render_stage.emit('PAUSED')
+                bus.stop_play.emit()
 
-    def resume_auto_segment_render(self):
+    def resume_auto_segment_render(self, job_id=None):
         if not self.auto_render_manifest_path:
-            self.auto_render_manifest_path = self._auto_manifest_for_video()
+            self.auto_render_manifest_path = self._auto_manifest_for_video(job_id)
         manifest = self._read_auto_render_manifest()
         if manifest is None:
-            print('[VideoManager] no auto-render checkpoint to resume')
+            bus.auto_render_failed.emit('No auto-render checkpoint to resume')
             return
         if os.path.abspath(self.target_video) != manifest.get('video'):
-            print('[VideoManager] checkpoint belongs to another video')
+            bus.auto_render_failed.emit('Render checkpoint belongs to another video')
+            return
+        try:
+            stat = os.stat(self.target_video)
+            if (int(manifest.get('video_size', stat.st_size)) != int(stat.st_size)
+                    or int(manifest.get('video_mtime_ns', stat.st_mtime_ns)) != int(stat.st_mtime_ns)):
+                bus.auto_render_failed.emit('Input video changed after the job was created')
+                return
+        except OSError as exc:
+            bus.auto_render_failed.emit(f'Cannot validate input video: {exc}')
             return
         self.auto_segment_ranges = [tuple(item) for item in manifest.get('ranges', [])]
+        self.auto_render_parameters = dict(manifest.get('render_params') or self.parameters)
         self.auto_render_active = True
-        self.current_frame = max(0, int(manifest.get('next_frame', 0)))
-        if self.current_frame >= self.video_frame_total:
-            self._finish_auto_render_parts(manifest)
+        self.auto_render_cancel_requested = False
+        self.auto_render_started_at = time.perf_counter()
+        stage = str(manifest.get('stage', 'RENDERING'))
+        final_output = manifest.get('final_output')
+        if stage in ('MERGING', 'MUXING') or int(manifest.get('next_frame', 0)) >= self.video_frame_total:
+            self._schedule_auto_finalize(manifest)
+            return
+        if stage == 'QC' and final_output and os.path.isfile(final_output):
+            bus.auto_render_finished.emit(final_output)
             return
         self.control['SwapFacesButton'] = True
+        self._start_auto_render_part(manifest)
+
+    def _start_auto_render_part(self, manifest):
+        if manifest is None:
+            bus.auto_render_failed.emit('Auto-render manifest is missing')
+            return
+        start = max(0, int(manifest.get('next_frame', 0)))
+        if start >= self.video_frame_total:
+            self._schedule_auto_finalize(manifest)
+            return
+        part_index = len(manifest.get('parts', []))
+        part_frames = max(1, int(manifest.get('part_frames', round(self.fps * 60))))
+        work_dir = manifest.get('work_dir')
+        os.makedirs(work_dir, exist_ok=True)
+        self.auto_current_part_final = os.path.join(work_dir, f'part{part_index:05d}.mp4')
+        self.auto_current_part_temp = os.path.join(work_dir, f'part{part_index:05d}.tmp.mp4')
+        self.auto_render_write_error = None
+        try:
+            os.remove(self.auto_current_part_temp)
+        except OSError:
+            pass
+        self.auto_render_part_end = min(self.video_frame_total - 1, start + part_frames - 1)
+        self.current_frame = start
+        manifest['stage'] = 'RENDERING'
+        manifest['current_part'] = part_index
+        manifest['current_part_start'] = start
+        manifest['current_part_end'] = self.auto_render_part_end
+        self._write_auto_render_manifest(manifest)
         self.play_video('record')
 
     def _record_auto_render_part(self, final_file, last_frame):
         manifest = self._read_auto_render_manifest()
         if manifest is None:
-            return
+            return None
         parts = list(manifest.get('parts', []))
-        parts.append(os.path.abspath(final_file))
+        absolute = os.path.abspath(final_file)
+        if absolute not in parts:
+            parts.append(absolute)
         manifest['parts'] = parts
         manifest['next_frame'] = int(last_frame) + 1
+        manifest['current_part'] = None
         self._write_auto_render_manifest(manifest)
-        if manifest['next_frame'] >= self.video_frame_total:
-            self._finish_auto_render_parts(manifest)
+        return manifest
+
+    def _schedule_auto_finalize(self, manifest):
+        self.auto_render_active = False
+        thread = threading.Thread(
+            target=self._finish_auto_render_parts, args=(dict(manifest),),
+            name='rope-auto-finalize', daemon=True,
+        )
+        thread.start()
 
     def _finish_auto_render_parts(self, manifest):
         parts = [path for path in manifest.get('parts', []) if os.path.isfile(path)]
         if not parts:
+            bus.auto_render_failed.emit('No completed render parts were found')
             return
-        if len(parts) == 1:
-            final_output = parts[0]
-        else:
-            ffmpeg_exe = _find_ffmpeg()
-            if ffmpeg_exe is None:
-                print('[VideoManager] ffmpeg required to join resumed render parts')
-                return
-            ext = os.path.splitext(parts[0])[1]
-            final_output = os.path.splitext(parts[0])[0] + '_resumed' + ext
-            concat_file = self.auto_render_manifest_path + '.concat.txt'
+        ffmpeg_exe = _find_ffmpeg()
+        if ffmpeg_exe is None:
+            bus.auto_render_failed.emit('FFmpeg is required to merge Auto Job parts')
+            return
+        work_dir = manifest.get('work_dir')
+        joined = os.path.join(work_dir, 'joined_video.mp4')
+        concat_file = os.path.join(work_dir, 'concat.txt')
+        final_output = manifest.get('final_output')
+        try:
+            manifest['stage'] = 'MERGING'
+            self._write_auto_render_manifest(manifest)
+            bus.auto_render_stage.emit('MERGING')
+            with open(concat_file, 'w', encoding='utf-8') as handle:
+                for path in parts:
+                    escaped = path.replace("'", "'\\''")
+                    handle.write(f"file '{escaped}'\n")
+            result = subprocess.run([
+                ffmpeg_exe, '-y', '-hide_banner', '-loglevel', 'error',
+                '-f', 'concat', '-safe', '0', '-i', concat_file,
+                '-c', 'copy', joined,
+            ])
+            if result.returncode != 0:
+                raise RuntimeError('FFmpeg could not concatenate render parts')
+
+            manifest['stage'] = 'MUXING'
+            self._write_auto_render_manifest(manifest)
+            bus.auto_render_stage.emit('MUXING')
+            final_temp = final_output + '.tmp.mp4'
+            mux_args = [
+                ffmpeg_exe, '-y', '-hide_banner', '-loglevel', 'error',
+                '-i', joined, '-i', self.target_video,
+                '-map', '0:v:0', '-map', '1:a:0?',
+                '-c:v', 'copy', '-c:a', 'copy', '-shortest', final_temp,
+            ]
+            result = subprocess.run(mux_args)
+            if result.returncode != 0:
+                # Some source audio codecs cannot be stored in MP4. Keep the
+                # video bit-exact and transcode audio only.
+                mux_args[mux_args.index('-c:a') + 1] = 'aac'
+                mux_args[mux_args.index('-shortest'):mux_args.index('-shortest')] = [
+                    '-b:a', '192k',
+                ]
+                result = subprocess.run(mux_args)
+            if result.returncode != 0:
+                raise RuntimeError('FFmpeg could not mux the original audio')
+            os.replace(final_temp, final_output)
+            manifest['stage'] = 'QC'
+            manifest['final_output'] = final_output
+            self._write_auto_render_manifest(manifest)
+            self.auto_render_active = False
+            print('[VideoManager] auto render ready for QC:', final_output)
+            bus.auto_render_finished.emit(final_output)
+        except Exception as exc:
+            manifest['stage'] = 'FAILED'
+            manifest['error'] = str(exc)
+            self._write_auto_render_manifest(manifest)
+            self.auto_render_active = False
+            bus.auto_render_failed.emit(str(exc))
+
+    def complete_auto_render_cleanup(self, job_id=None):
+        """Remove temporary parts only after the GUI-side QC succeeds."""
+        if not self.auto_render_manifest_path and job_id:
+            self.auto_render_manifest_path = self._auto_manifest_for_video(job_id)
+        manifest = self._read_auto_render_manifest()
+        if manifest is None:
+            return
+        work_dir = os.path.abspath(str(manifest.get('work_dir', '')))
+        saved = os.path.abspath(str(self.saved_video_path))
+        try:
+            safe = (work_dir and os.path.commonpath([work_dir, saved]) == saved
+                    and os.path.basename(work_dir).startswith('.rope_'))
+        except ValueError:
+            safe = False
+        if safe:
             try:
-                with open(concat_file, 'w', encoding='utf-8') as handle:
-                    for path in parts:
-                        escaped = path.replace("'", "'\\''")
-                        handle.write(f"file '{escaped}'\n")
-                result = subprocess.run([
-                    ffmpeg_exe, '-hide_banner', '-loglevel', 'error',
-                    '-f', 'concat', '-safe', '0', '-i', concat_file,
-                    '-c', 'copy', final_output,
-                ])
-                if result.returncode != 0:
-                    print('[VideoManager] failed to concatenate resumed parts')
-                    return
-            finally:
-                try:
-                    os.remove(concat_file)
-                except OSError:
-                    pass
-            for path in parts:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+                shutil.rmtree(work_dir)
+            except OSError:
+                pass
         try:
             os.remove(self.auto_render_manifest_path)
         except OSError:
             pass
         self.auto_render_manifest_path = None
-        self.auto_render_active = False
-        print('[VideoManager] auto render complete:', final_output)
+        self.auto_render_parameters = None
 
 
     def load_target_video( self, file ):
@@ -1122,8 +1304,14 @@ class VideoManager():
             self.total_thread_time = 0.0
             self.process_qs = []
 
-            self._ensure_executor(self.parameters['ThreadsSlider'])
-            for i in range(self.parameters['ThreadsSlider']):
+            record_params = (
+                self.auto_render_parameters
+                if self.auto_render_active and self.auto_render_parameters is not None
+                else self.parameters
+            )
+            record_threads = max(1, int(record_params.get('ThreadsSlider', 1)))
+            self._ensure_executor(record_threads)
+            for i in range(record_threads):
                     new_process_q = self.process_q.copy()
                     self.process_qs.append(new_process_q)
 
@@ -1139,7 +1327,35 @@ class VideoManager():
             self.output = os.path.join(self.saved_video_path, base_filename)
             self.temp_file = self.output+"_temp"+self.file_name[1]
 
-            if self.parameters['RecordTypeTextSel']=='FFMPEG':
+            if self.auto_render_active and self.auto_render_manifest_path:
+                manifest = self._read_auto_render_manifest() or {}
+                ffmpeg_exe = _find_ffmpeg()
+                if ffmpeg_exe is None:
+                    self.record = self.play = False
+                    bus.auto_render_failed.emit('FFmpeg disappeared before render started')
+                    return
+                encoder = str(manifest.get('encoder', 'libx264'))
+                self.auto_render_encoder = encoder
+                quality = str(record_params.get('VideoQualSlider', 18))
+                args = [
+                    ffmpeg_exe, '-y', '-hide_banner', '-loglevel', 'error',
+                    '-f', 'rawvideo', '-pixel_format', 'rgb24',
+                    '-video_size', f'{frame_width}x{frame_height}',
+                    '-framerate', str(self.fps), '-i', 'pipe:0', '-an',
+                    '-c:v', encoder,
+                ]
+                if encoder == 'h264_nvenc':
+                    args.extend(['-preset', 'p4', '-cq', quality])
+                else:
+                    args.extend(['-preset', 'medium', '-crf', quality])
+                args.extend(['-pix_fmt', 'yuv420p', self.auto_current_part_temp])
+                try:
+                    self.sp = subprocess.Popen(args, stdin=subprocess.PIPE)
+                except OSError as exc:
+                    self.record = self.play = False
+                    bus.auto_render_failed.emit(f'Could not start Auto Job encoder: {exc}')
+                    return
+            elif self.parameters['RecordTypeTextSel']=='FFMPEG':
                 ffmpeg_exe = _find_ffmpeg()
                 if ffmpeg_exe is None:
                     print('[VideoManager] ffmpeg.exe not found on PATH or in '
@@ -1191,7 +1407,14 @@ class VideoManager():
         # break — no point iterating further when the queue is dry.
         if self.play == True and self.is_video_loaded == True and self.player is not None:
             for item in self.process_qs:
-                if item['Status'] == 'clear' and self.current_frame < self.video_frame_total:
+                within_auto_part = (
+                    not self.auto_render_active
+                    or self.auto_render_part_end is None
+                    or self.current_frame <= self.auto_render_part_end
+                )
+                if (item['Status'] == 'clear'
+                        and self.current_frame < self.video_frame_total
+                        and within_auto_part):
                     res = self.player.get_next_frame(timeout=0)
                     if res is None:
                         break  # decoder hasn't produced a frame yet — try later
@@ -1305,7 +1528,13 @@ class VideoManager():
                     if isinstance(image, torch.Tensor):
                         image = image.cpu().numpy()
 
-                    if self.parameters['RecordTypeTextSel']=='FFMPEG':
+                    if self.auto_render_active and self.auto_render_manifest_path:
+                        try:
+                            self.sp.stdin.write(np.ascontiguousarray(image, dtype=np.uint8).tobytes())
+                        except (BrokenPipeError, OSError) as exc:
+                            self.auto_render_write_error = str(exc)
+                            self.play = False
+                    elif self.parameters['RecordTypeTextSel']=='FFMPEG':
                         pil_image = Image.fromarray(image)
                         pil_image.save(self.sp.stdin, 'BMP')
 
@@ -1316,63 +1545,157 @@ class VideoManager():
                         image, self.process_qs[index]['FrameNumber'], False,
                     )
 
+                    if self.auto_render_active:
+                        rendered_frame = int(self.process_qs[index]['FrameNumber'])
+                        if (rendered_frame - self.auto_render_last_progress_frame >= 15
+                                or rendered_frame >= self.video_frame_total - 1):
+                            self.auto_render_last_progress_frame = rendered_frame
+                            fraction = min(1.0, (rendered_frame + 1) / max(1, self.video_frame_total))
+                            elapsed = max(0.001, time.perf_counter() - (
+                                self.auto_render_started_at or time.perf_counter()
+                            ))
+                            eta = int(elapsed * (1.0 - fraction) / max(0.001, fraction))
+                            manifest = self._read_auto_render_manifest() or {}
+                            part_frames = max(1, int(manifest.get('part_frames', self.video_frame_total)))
+                            total_parts = int(ceil(self.video_frame_total / part_frames))
+                            bus.auto_render_progress.emit({
+                                'frame': rendered_frame, 'frames': self.video_frame_total,
+                                'part': len(manifest.get('parts', [])) + 1,
+                                'parts': total_parts, 'percent': fraction * 100.0,
+                                'eta_seconds': eta,
+                            })
+
                     # Close video and process
-                    if self.process_qs[index]['FrameNumber'] >= self.video_frame_total-1 or self.process_qs[index]['FrameNumber'] == self.stop_marker or self.play == False:
+                    auto_part_done = (
+                        self.auto_render_active
+                        and self.auto_render_part_end is not None
+                        and self.process_qs[index]['FrameNumber'] >= self.auto_render_part_end
+                    )
+                    if (self.process_qs[index]['FrameNumber'] >= self.video_frame_total-1
+                            or self.process_qs[index]['FrameNumber'] == self.stop_marker
+                            or self.play == False or auto_part_done):
                         # Capture the last-recorded frame number BEFORE
                         # play_video("stop") clears process_qs slots.
                         last_recorded_frame = self.process_qs[index]['FrameNumber']
-                        self.play_video("stop")
+                        is_auto_part = bool(
+                            self.auto_render_active and self.auto_render_manifest_path
+                        )
+                        if is_auto_part:
+                            self.play = False
+                            if self.player is not None:
+                                self.player.stop_playback()
+                        else:
+                            self.play_video("stop")
                         stop_time = float(last_recorded_frame + 1) / float(self.fps)
                         if stop_time == 0:
                             stop_time = float(self.video_frame_total) / float(self.fps)
-                        
-                        if self.parameters['RecordTypeTextSel']=='FFMPEG':
-                            self.sp.stdin.close()
-                            self.sp.wait()
-                        elif self.parameters['RecordTypeTextSel']=='OPENCV':    
-                            self.sp.release()
 
-                        orig_file = self.target_video
-                        final_file = self.output+self.file_name[1]
-                        ffmpeg_exe = _find_ffmpeg()
-                        if ffmpeg_exe is None:
-                            # Recording succeeded but we can't mux audio.
-                            # Promote the temp file to the final filename
-                            # so the user at least keeps the silent video.
-                            print('[VideoManager] ffmpeg.exe not found for '
-                                  'audio mux step — saving video without '
-                                  'audio as %s' % final_file)
+                        next_manifest = None
+                        if is_auto_part:
                             try:
-                                os.replace(self.temp_file, final_file)
-                            except OSError as e:
-                                print('[VideoManager] could not rename temp '
-                                      'file: %s' % e)
-                        else:
-                            print("adding audio...")
-                            args = [ffmpeg_exe,
-                                    '-hide_banner',
-                                    '-loglevel',    'error',
-                                    "-i", self.temp_file,
-                                    "-ss", str(self.start_time), "-to", str(stop_time), "-i",  orig_file,
-                                    "-c",  "copy", # may be c:v
-                                    "-map", "0:v:0", "-map", "1:a:0?",
-                                    "-shortest",
-                                    final_file]
-                            subprocess.run(args)
-                            try:
-                                os.remove(self.temp_file)
+                                self.sp.stdin.close()
                             except OSError:
                                 pass
+                            return_code = self.sp.wait()
+                            write_error = getattr(self, 'auto_render_write_error', None)
+                            if return_code != 0 or write_error:
+                                message = write_error or (
+                                    f'FFmpeg encoder exited with code {return_code}'
+                                )
+                                manifest = self._read_auto_render_manifest() or {}
+                                if getattr(self, 'auto_render_encoder', '') == 'h264_nvenc':
+                                    # The capability probe passed but the live
+                                    # encode can still fail (driver reset, NVENC
+                                    # session limit, VRAM pressure). Retry this
+                                    # same part with software x264, preserving
+                                    # every completed checkpoint.
+                                    manifest['encoder'] = 'libx264'
+                                    manifest['stage'] = 'RENDERING'
+                                    manifest['encoder_fallback_reason'] = message
+                                    self._write_auto_render_manifest(manifest)
+                                    try:
+                                        os.remove(self.auto_current_part_temp)
+                                    except OSError:
+                                        pass
+                                    next_manifest = manifest
+                                else:
+                                    manifest['stage'] = 'FAILED'
+                                    manifest['error'] = message
+                                    self._write_auto_render_manifest(manifest)
+                                    self.auto_render_active = False
+                                    bus.auto_render_failed.emit(message)
+                            else:
+                                try:
+                                    os.replace(
+                                        self.auto_current_part_temp,
+                                        self.auto_current_part_final,
+                                    )
+                                except OSError as exc:
+                                    self.auto_render_active = False
+                                    bus.auto_render_failed.emit(
+                                        f'Could not finalize render part: {exc}'
+                                    )
+                                else:
+                                    manifest = self._record_auto_render_part(
+                                        self.auto_current_part_final,
+                                        last_recorded_frame,
+                                    )
+                                    if manifest is not None:
+                                        if self.auto_render_cancel_requested:
+                                            manifest['stage'] = 'PAUSED'
+                                            self._write_auto_render_manifest(manifest)
+                                            self.auto_render_active = False
+                                            bus.auto_render_stage.emit('PAUSED')
+                                            bus.stop_play.emit()
+                                        elif int(manifest.get('next_frame', 0)) >= self.video_frame_total:
+                                            manifest['stage'] = 'MERGING'
+                                            self._write_auto_render_manifest(manifest)
+                                            self._schedule_auto_finalize(manifest)
+                                        else:
+                                            next_manifest = manifest
+                            self.record = False
+                        else:
+                            if self.parameters['RecordTypeTextSel']=='FFMPEG':
+                                self.sp.stdin.close()
+                                self.sp.wait()
+                            elif self.parameters['RecordTypeTextSel']=='OPENCV':
+                                self.sp.release()
 
-                        timef= time.time() - self.timer 
-                        if self.auto_render_manifest_path:
-                            self._record_auto_render_part(final_file, last_recorded_frame)
-                        self.record = False
-                        self.auto_segment_ranges = None
-                        self.auto_render_active = False
-                        print('Video saved as:', final_file)
-                        msg = "Total time: %s s." % (round(timef,1))
-                        print(msg)
+                            orig_file = self.target_video
+                            final_file = self.output+self.file_name[1]
+                            ffmpeg_exe = _find_ffmpeg()
+                            if ffmpeg_exe is None:
+                                print('[VideoManager] ffmpeg.exe not found for '
+                                      'audio mux step — saving video without '
+                                      'audio as %s' % final_file)
+                                try:
+                                    os.replace(self.temp_file, final_file)
+                                except OSError as e:
+                                    print('[VideoManager] could not rename temp '
+                                          'file: %s' % e)
+                            else:
+                                print("adding audio...")
+                                args = [ffmpeg_exe,
+                                        '-hide_banner',
+                                        '-loglevel',    'error',
+                                        "-i", self.temp_file,
+                                        "-ss", str(self.start_time), "-to", str(stop_time), "-i",  orig_file,
+                                        "-c",  "copy",
+                                        "-map", "0:v:0", "-map", "1:a:0?",
+                                        "-shortest",
+                                        final_file]
+                                subprocess.run(args)
+                                try:
+                                    os.remove(self.temp_file)
+                                except OSError:
+                                    pass
+
+                            timef= time.time() - self.timer
+                            self.record = False
+                            self.auto_segment_ranges = None
+                            self.auto_render_active = False
+                            print('Video saved as:', final_file)
+                            print("Total time: %s s." % (round(timef,1)))
 
                         
                     self.total_thread_time = []
@@ -1380,6 +1703,8 @@ class VideoManager():
                     self.process_qs[index]['FrameNumber'] = []
                     self.process_qs[index]['Thread'] = []
                     self.frame_timer = time.time()
+                    if 'next_manifest' in locals() and next_manifest is not None:
+                        self._start_auto_render_part(next_manifest)
     # @profile
     def thread_video_read(self, target_image, frame_number):
         # The frame is already decoded — process() pulled it from the
@@ -1403,14 +1728,17 @@ class VideoManager():
             or ranges is None
             or any(start <= frame_number <= end for start, end in ranges)
         )
-        if not self.control['SwapFacesButton'] or not in_auto_range:
+        swap_enabled = self.auto_render_active or self.control['SwapFacesButton']
+        if not swap_enabled or not in_auto_range:
             # Pass the decoder output through untouched — the Qt preview
             # handles both CUDA HxWx3 uint8 tensors (fast path) and numpy
             # (CPU fallback). Avoid the GPU->CPU bounce that would force
             # the slow path even when torchcodec decoded on GPU.
             output = target_image
         else:
-            output = self.swap_video(target_image, frame_number, True)
+            output = self.swap_video(
+                target_image, frame_number, not self.auto_render_active,
+            )
 
         for item in self.process_qs:
             if item['FrameNumber'] == frame_number:
@@ -1442,7 +1770,11 @@ class VideoManager():
 
     def _swap_video_inner(self, target_image, frame_number, use_markers):
         # Grab a local copy of the parameters to prevent threading issues
-        parameters = self.parameters.copy()
+        parameters = (
+            self.auto_render_parameters
+            if self.auto_render_active and self.auto_render_parameters is not None
+            else self.parameters
+        ).copy()
         control = self.control.copy()
 
         # Find out if the frame is in a marker zone and copy the parameters if true

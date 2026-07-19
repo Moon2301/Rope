@@ -47,6 +47,12 @@ class Bus(QObject):
     # success. Emitted from a background thread; AutoConnection queues it
     # onto the GUI thread.
     models_preloaded = Signal()
+    # Persistent Auto Job render lifecycle.  Progress is frame/part based;
+    # stage drives MERGING/MUXING/PAUSED state; finished carries final path.
+    auto_render_progress = Signal(object)
+    auto_render_stage = Signal(str)
+    auto_render_finished = Signal(str)
+    auto_render_failed = Signal(str)
 
 
 bus = Bus()

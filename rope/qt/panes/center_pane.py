@@ -268,7 +268,7 @@ class CenterPane(QFrame):
         self.buttons["FindFacesButton"] = find_btn
         header.addWidget(find_btn)
 
-        auto_btn = QPushButton("Auto Segments")
+        auto_btn = QPushButton("Start Auto Job")
         auto_btn.clicked.connect(lambda *_: self.auto_segments_pressed.emit())
         self.buttons["AutoSegmentsButton"] = auto_btn
         header.addWidget(auto_btn)
@@ -282,6 +282,11 @@ class CenterPane(QFrame):
         outer.addWidget(self.found_faces_gallery, stretch=1)
 
         return frame
+
+    def set_auto_job_pending(self, pending: bool) -> None:
+        button = self.buttons.get("AutoSegmentsButton")
+        if button is not None:
+            button.setText("Resume Auto Job" if pending else "Start Auto Job")
 
     # ---- Timeline ----------------------------------------------------------------
 

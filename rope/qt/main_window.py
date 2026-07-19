@@ -17,14 +17,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 import os
+import shutil
 import time
 import threading
 from typing import Any
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QRunnable, QStandardPaths, Qt, QThreadPool, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtCore import QObject, QRunnable, QStandardPaths, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -55,8 +56,10 @@ from rope.qt.widgets.text import Text
 from rope.qt.widgets.vram_indicator import VRAMIndicator
 from rope.AutoSegments import (
     SequentialScanDecoder, approved_ranges, group_matches,
-    load_scan_manifest, save_scan_manifest, scan_cache_key,
+    load_scan_manifest, mark_segments_for_review, save_scan_manifest,
+    scan_cache_key,
 )
+from rope.Automation import AutomationController, JobState, fingerprint_video
 from rope.qt.widgets.auto_segments_dialog import AutoSegmentsDialog
 
 
@@ -104,6 +107,7 @@ def _cosine_similarity_pct(v1: np.ndarray, v2: np.ndarray) -> float:
 
 class _AutoScanSignals(QObject):
     progress = Signal(object)
+    checkpoint = Signal(object)
     finished = Signal(object)
     failed = Signal(str)
 
@@ -136,7 +140,7 @@ class _AutoScanWorker(QRunnable):
             chunk_frames = max(1, int(round(fps * 300.0)))
             total_chunks = max(1, int(np.ceil(total_frames / chunk_frames)))
             config = {
-                'algorithm_version': 2,
+                'algorithm_version': 3,
                 'threshold': self.threshold,
                 'sample_interval_seconds': self.sample_interval,
                 'refine_radius_seconds': 1.0,
@@ -152,6 +156,10 @@ class _AutoScanWorker(QRunnable):
             manifest = load_scan_manifest(self.cache_dir, key) or {
                 'config': config, 'completed_chunks': [], 'chunks': {},
             }
+            self.signals.checkpoint.emit({
+                'cache_key': key, 'cache_dir': self.cache_dir,
+                'completed_chunks': list(manifest.get('completed_chunks', [])),
+            })
             completed = {int(value) for value in manifest.get('completed_chunks', [])}
             cached = len(completed) == total_chunks
             decoder = SequentialScanDecoder(
@@ -187,6 +195,24 @@ class _AutoScanWorker(QRunnable):
                     best = max(best, _cosine_similarity_pct(embedding, self.target))
                 return best
 
+            checkpoint_calls = 100
+            checkpoint_seconds = 10.0
+
+            def save_chunk(chunk_index, chunk_state, *, mark_complete=False):
+                manifest.setdefault('chunks', {})[str(chunk_index)] = chunk_state
+                if mark_complete:
+                    completed.add(chunk_index)
+                manifest['completed_chunks'] = sorted(completed)
+                save_scan_manifest(self.cache_dir, key, manifest)
+                self.signals.checkpoint.emit({
+                    'cache_key': key, 'cache_dir': self.cache_dir,
+                    'completed_chunks': sorted(completed),
+                    'chunk': int(chunk_index),
+                    'stage': str(chunk_state.get('stage', 'coarse')),
+                    'coarse_cursor': int(chunk_state.get('coarse_cursor', 0)),
+                    'refine_cursor': int(chunk_state.get('refine_cursor', 0)),
+                })
+
             for chunk_index in range(total_chunks):
                 if chunk_index in completed:
                     emit_progress(chunk_index, 'cache', 1, 1)
@@ -194,22 +220,62 @@ class _AutoScanWorker(QRunnable):
                 start = chunk_index * chunk_frames
                 end = min(total_frames, start + chunk_frames)
                 coarse_targets = list(range(start, end, coarse_stride))
-                coarse_hits = {}
-                near_hits = {}
-                for sample_index, (frame_no, rgb) in enumerate(
-                    decoder.iter_frames(coarse_targets, self.cancel_event), 1
-                ):
-                    similarity = score_rgb(rgb)
-                    if similarity >= self.threshold:
-                        coarse_hits[frame_no] = similarity
-                    elif similarity >= self.threshold - 8.0:
-                        near_hits[frame_no] = similarity
-                    emit_progress(
-                        chunk_index, 'coarse', sample_index, len(coarse_targets)
-                    )
-                if self.cancel_event.is_set():
-                    self.signals.failed.emit("Đã hủy scan; các chunk trước đã được lưu.")
-                    return
+                chunk_state = dict(manifest.get('chunks', {}).get(str(chunk_index), {}))
+                chunk_state.setdefault('start_frame', start)
+                chunk_state.setdefault('end_frame', end - 1)
+                stage = str(chunk_state.get('stage', 'coarse'))
+                coarse_hits = {
+                    int(frame): float(score)
+                    for frame, score in chunk_state.get('coarse_hits', [])
+                }
+                near_hits = {
+                    int(frame): float(score)
+                    for frame, score in chunk_state.get('near_hits', [])
+                }
+                coarse_cursor = max(0, min(
+                    len(coarse_targets), int(chunk_state.get('coarse_cursor', 0))
+                ))
+
+                if stage == 'coarse':
+                    last_checkpoint = time.perf_counter()
+                    calls_since_checkpoint = 0
+                    pending = coarse_targets[coarse_cursor:]
+                    for offset, (frame_no, rgb) in enumerate(
+                        decoder.iter_frames(pending, self.cancel_event), 1
+                    ):
+                        similarity = score_rgb(rgb)
+                        if similarity >= self.threshold:
+                            coarse_hits[frame_no] = similarity
+                        elif similarity >= self.threshold - 8.0:
+                            near_hits[frame_no] = similarity
+                        coarse_cursor += 1
+                        calls_since_checkpoint += 1
+                        chunk_state.update({
+                            'stage': 'coarse', 'coarse_cursor': coarse_cursor,
+                            'coarse_hits': [[frame, score] for frame, score in sorted(coarse_hits.items())],
+                            'near_hits': [[frame, score] for frame, score in sorted(near_hits.items())],
+                        })
+                        now = time.perf_counter()
+                        if (calls_since_checkpoint >= checkpoint_calls
+                                or now - last_checkpoint >= checkpoint_seconds):
+                            save_chunk(chunk_index, chunk_state)
+                            calls_since_checkpoint = 0
+                            last_checkpoint = now
+                        emit_progress(
+                            chunk_index, 'coarse', coarse_cursor, len(coarse_targets)
+                        )
+                    if self.cancel_event.is_set():
+                        save_chunk(chunk_index, chunk_state)
+                        self.signals.failed.emit(
+                            "Đã dừng scan; tiến độ trong chunk hiện tại đã được lưu."
+                        )
+                        return
+                    chunk_state.update({
+                        'stage': 'refine', 'coarse_cursor': len(coarse_targets),
+                        'coarse_hits': [[frame, score] for frame, score in sorted(coarse_hits.items())],
+                        'near_hits': [[frame, score] for frame, score in sorted(near_hits.items())],
+                    })
+                    save_chunk(chunk_index, chunk_state)
 
                 candidates = sorted(set(coarse_hits) | set(near_hits))
                 refine_targets = sorted({
@@ -221,32 +287,54 @@ class _AutoScanWorker(QRunnable):
                         refine_stride,
                     )
                 })
-                refined_hits = dict(coarse_hits)
-                for sample_index, (frame_no, rgb) in enumerate(
-                    decoder.iter_frames(refine_targets, self.cancel_event), 1
+                refined_hits = {
+                    int(frame): float(score)
+                    for frame, score in chunk_state.get('hits', [])
+                } or dict(coarse_hits)
+                refine_cursor = max(0, min(
+                    len(refine_targets), int(chunk_state.get('refine_cursor', 0))
+                ))
+                last_checkpoint = time.perf_counter()
+                calls_since_checkpoint = 0
+                pending_refine = refine_targets[refine_cursor:]
+                for offset, (frame_no, rgb) in enumerate(
+                    decoder.iter_frames(pending_refine, self.cancel_event), 1
                 ):
                     similarity = score_rgb(rgb)
                     if similarity >= self.threshold:
                         refined_hits[frame_no] = max(
                             similarity, refined_hits.get(frame_no, 0.0)
                         )
+                    refine_cursor += 1
+                    calls_since_checkpoint += 1
+                    chunk_state.update({
+                        'stage': 'refine', 'refine_cursor': refine_cursor,
+                        'hits': [[frame, score] for frame, score in sorted(refined_hits.items())],
+                    })
+                    now = time.perf_counter()
+                    if (calls_since_checkpoint >= checkpoint_calls
+                            or now - last_checkpoint >= checkpoint_seconds):
+                        save_chunk(chunk_index, chunk_state)
+                        calls_since_checkpoint = 0
+                        last_checkpoint = now
                     emit_progress(
-                        chunk_index, 'refine', sample_index, len(refine_targets)
+                        chunk_index, 'refine', refine_cursor, len(refine_targets)
                     )
                 if not refine_targets:
                     emit_progress(chunk_index, 'refine', 1, 1)
                 if self.cancel_event.is_set():
-                    self.signals.failed.emit("Đã hủy scan; các chunk trước đã được lưu.")
+                    save_chunk(chunk_index, chunk_state)
+                    self.signals.failed.emit(
+                        "Đã dừng scan; tiến độ refine hiện tại đã được lưu."
+                    )
                     return
 
-                manifest.setdefault('chunks', {})[str(chunk_index)] = {
-                    'start_frame': start, 'end_frame': end - 1,
+                chunk_state.update({
+                    'stage': 'complete', 'refine_cursor': len(refine_targets),
                     'hits': [[frame, score] for frame, score in sorted(refined_hits.items())],
                     'near_hits': [[frame, score] for frame, score in sorted(near_hits.items())],
-                }
-                completed.add(chunk_index)
-                manifest['completed_chunks'] = sorted(completed)
-                save_scan_manifest(self.cache_dir, key, manifest)
+                })
+                save_chunk(chunk_index, chunk_state, mark_complete=True)
 
             matches = []
             for chunk in manifest.get('chunks', {}).values():
@@ -255,8 +343,13 @@ class _AutoScanWorker(QRunnable):
                 matches, stride=refine_stride, gap_frames=self.gap,
                 padding_frames=self.padding, total_frames=total_frames,
             )
+            segments = mark_segments_for_review(
+                segments, threshold=self.threshold, fps=fps,
+            )
 
             thumbnails = {}
+            thumb_dir = Path(self.cache_dir) / f"{key}.thumbs"
+            thumb_dir.mkdir(parents=True, exist_ok=True)
             for row, segment in enumerate(segments):
                 if self.cancel_event.is_set():
                     self.signals.failed.emit("Đã hủy scan.")
@@ -268,6 +361,15 @@ class _AutoScanWorker(QRunnable):
                 }
                 thumbnails[row] = {}
                 for name, frame_no in points.items():
+                    thumb_path = thumb_dir / (
+                        f"{segment.start_frame}_{segment.end_frame}_{name}.jpg"
+                    )
+                    cached_thumb = cv2.imread(str(thumb_path), cv2.IMREAD_COLOR)
+                    if cached_thumb is not None:
+                        thumbnails[row][name] = cv2.cvtColor(
+                            cached_thumb, cv2.COLOR_BGR2RGB,
+                        )
+                        continue
                     frame, _pts = player.get_frame_at(frame_no)
                     if isinstance(frame, torch.Tensor):
                         frame = frame.cpu().numpy()
@@ -278,11 +380,156 @@ class _AutoScanWorker(QRunnable):
                         frame, (max(1, int(w * scale)), max(1, int(h * scale))),
                         interpolation=cv2.INTER_AREA,
                     )
+                    cv2.imwrite(
+                        str(thumb_path),
+                        cv2.cvtColor(thumbnails[row][name], cv2.COLOR_RGB2BGR),
+                    )
             self.signals.finished.emit({
                 'segments': segments, 'thumbnails': thumbnails, 'cached': cached,
             })
         except Exception as exc:
             self.signals.failed.emit(f"Quét thất bại: {exc}")
+
+
+class _AutoQCSignals(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+
+class _AutoQCWorker(QRunnable):
+    """Lightweight output validation with bounded identity sampling."""
+
+    def __init__(self, vm, job, output_path):
+        super().__init__()
+        self.vm = vm
+        self.job = job
+        self.output_path = str(output_path)
+        self.signals = _AutoQCSignals()
+
+    @Slot()
+    def run(self):
+        cap = None
+        try:
+            import av
+            import torch
+            expected = self.job.video_meta
+            cap = cv2.VideoCapture(self.output_path)
+            if not cap.isOpened():
+                raise RuntimeError("Output không mở được bằng decoder")
+            width = int(round(cap.get(cv2.CAP_PROP_FRAME_WIDTH)))
+            height = int(round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frames = int(round(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
+            expected_frames = int(expected.get('total_frames', 0))
+            expected_fps = float(expected.get('fps', 0.0))
+            checks = {
+                'readable': True,
+                'resolution': [width, height],
+                'fps': fps,
+                'frame_count': frames,
+            }
+            failures = []
+            warnings = []
+            if [width, height] != [int(expected.get('width', width)), int(expected.get('height', height))]:
+                failures.append("resolution output không khớp input")
+            if expected_fps > 0 and abs(fps - expected_fps) > 0.05:
+                failures.append(f"FPS sai: {fps:.3f} thay vì {expected_fps:.3f}")
+            if expected_frames > 0 and abs(frames - expected_frames) > 2:
+                failures.append(f"frame count sai: {frames} thay vì {expected_frames}")
+            duration = frames / fps if fps > 0 else 0.0
+            expected_duration = (
+                expected_frames / expected_fps
+                if expected_frames > 0 and expected_fps > 0 else duration
+            )
+            checks['duration_seconds'] = duration
+            checks['expected_duration_seconds'] = expected_duration
+            if abs(duration - expected_duration) > max(0.1, 2.0 / max(1.0, expected_fps)):
+                failures.append(
+                    f"duration sai: {duration:.3f}s thay vì {expected_duration:.3f}s"
+                )
+
+            with av.open(self.job.video_path) as source_container:
+                source_has_audio = bool(source_container.streams.audio)
+            with av.open(self.output_path) as output_container:
+                output_has_audio = bool(output_container.streams.audio)
+            checks['source_has_audio'] = source_has_audio
+            checks['output_has_audio'] = output_has_audio
+            if source_has_audio and not output_has_audio:
+                failures.append("output bị thiếu audio gốc")
+
+            points = []
+            for segment in self.job.segments:
+                if not segment.get('approved'):
+                    continue
+                start = int(segment['start_frame'])
+                end = int(segment['end_frame'])
+                points.extend((start, (start + end) // 2, end))
+            points = sorted(set(max(0, min(max(0, frames - 1), value)) for value in points))
+            if len(points) > 30:
+                indices = np.linspace(0, len(points) - 1, 30).astype(int)
+                points = [points[index] for index in indices]
+
+            black = 0
+            decoded = 0
+            similarities = []
+            source_embedding = np.asarray(self.job.source_embedding, dtype=np.float32)
+            config = self.job.scan_config
+            for frame_no in points:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+                ok, bgr = cap.read()
+                if not ok or bgr is None:
+                    continue
+                decoded += 1
+                if float(bgr.mean()) < 1.0 and float(bgr.std()) < 1.0:
+                    black += 1
+                    continue
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                tensor = torch.from_numpy(np.ascontiguousarray(rgb)).to('cuda').permute(2, 0, 1)
+                kpss = self.vm.models.run_detect(
+                    tensor, str(config.get('detector', 'Retinaface')), max_num=20,
+                    score=float(config.get('detect_score', 50)) / 100.0,
+                    input_size=int(config.get('input_size', 640)),
+                )
+                best = None
+                for kps in kpss:
+                    embedding, _crop = self.vm.models.run_recognize(tensor, kps)
+                    value = _cosine_similarity_pct(embedding, source_embedding)
+                    best = value if best is None else max(best, value)
+                if best is not None:
+                    similarities.append(float(best))
+
+            checks['sample_points'] = len(points)
+            checks['decoded_samples'] = decoded
+            checks['black_samples'] = black
+            if points and decoded == 0:
+                failures.append("không decode được frame QC")
+            elif decoded > 0 and black == decoded:
+                failures.append("toàn bộ frame QC đều đen")
+
+            identity_threshold = max(45.0, float(config.get('threshold', 55)) - 10.0)
+            identity_passes = sum(value >= identity_threshold for value in similarities)
+            identity_rate = identity_passes / max(1, len(similarities))
+            checks['identity_threshold'] = identity_threshold
+            checks['identity_samples'] = len(similarities)
+            checks['identity_pass_rate'] = identity_rate
+            checks['identity_mean'] = float(np.mean(similarities)) if similarities else None
+            if len(similarities) >= 3 and identity_rate < 0.5:
+                failures.append("identity sau swap không đủ gần source")
+            elif len(similarities) < 3:
+                warnings.append("không đủ 3 mẫu mặt đo được để kết luận identity")
+
+            result = {
+                'passed': not failures,
+                'checks': checks,
+                'warnings': warnings,
+                'failures': failures,
+            }
+            self.signals.finished.emit(result)
+        except Exception as exc:
+            self.signals.failed.emit(f"QC thất bại: {exc}")
+        finally:
+            if cap is not None:
+                cap.release()
 
 
 class MainWindow(QMainWindow):
@@ -292,6 +539,13 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(_bronze_circle_icon())
 
         self.settings = Settings.load()
+        app_data = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        if not app_data:
+            app_data = os.path.join(os.getcwd(), ".rope_app_data")
+        self._automation = AutomationController(
+            os.path.join(app_data, "automation_jobs")
+        )
+        self._active_auto_job = self._automation.store.latest_resumable()
         w, h, x, y = self.settings.dock_win_geom
         self.setGeometry(int(x), int(y), int(w), int(h))
 
@@ -352,6 +606,7 @@ class MainWindow(QMainWindow):
 
         self._build_middle(root)
         self._build_bottom_bar(root)
+        self._center_pane.set_auto_job_pending(self._active_auto_job is not None)
 
         # Pull refs to the Settings-tab "Actions" group buttons into
         # self._buttons so the existing enable/disable code (which
@@ -659,15 +914,33 @@ class MainWindow(QMainWindow):
         bus.slider_length_changed.connect(cp.timeline.set_length)
         # Preload build finished → settle the Preload Models button.
         bus.models_preloaded.connect(self._on_models_preloaded)
+        bus.auto_render_progress.connect(self._on_auto_render_progress)
+        bus.auto_render_stage.connect(self._on_auto_render_stage)
+        bus.auto_render_finished.connect(self._on_auto_render_finished)
+        bus.auto_render_failed.connect(self._on_auto_render_failed)
 
     def _open_auto_segments(self) -> None:
-        if not getattr(getattr(self, '_coordinator', None), 'vm', None):
-            QMessageBox.warning(self, "Auto Segments", "Backend video chưa sẵn sàng.")
+        existing_dialog = getattr(self, '_auto_segments_dialog', None)
+        if existing_dialog is not None:
+            existing_dialog.show()
+            existing_dialog.raise_()
+            existing_dialog.activateWindow()
             return
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        if vm is None:
+            QMessageBox.warning(self, "Auto Job", "Backend video chưa sẵn sàng.")
+            return
+        current_video = vm.target_video if getattr(vm, 'is_video_loaded', False) else None
+        pending = self._automation.store.latest_resumable(current_video)
+        if pending is None and not self._found_faces:
+            pending = self._automation.store.latest_resumable()
+        if pending is not None:
+            self._active_auto_job = pending
+            self._restore_auto_job_context(pending)
         if not self._found_faces:
             QMessageBox.information(
-                self, "Auto Segments",
-                "Hãy mở một frame có nhân vật và bấm Find Faces trước.",
+                self, "Auto Job",
+                "Hãy mở frame có nhân vật, bấm Find Faces và gán source face trước.",
             )
             return
         gallery = self._center_pane.found_faces_gallery
@@ -680,91 +953,707 @@ class MainWindow(QMainWindow):
         dialog.scan_requested.connect(self._start_auto_scan)
         dialog.render_requested.connect(self._start_auto_render)
         dialog.seek_requested.connect(self._seek_to_frame)
-        dialog.cancel_scan_requested.connect(self._cancel_auto_scan)
-        dialog.cancel_render_requested.connect(self._cancel_auto_render)
-        dialog.resume_render_requested.connect(self._resume_auto_render)
+        dialog.preview_segment_requested.connect(self._preview_auto_segment)
+        dialog.pause_job_requested.connect(self._pause_auto_job)
+        dialog.resume_job_requested.connect(self._resume_auto_job)
+        dialog.retry_job_requested.connect(self._retry_auto_job)
+        dialog.open_output_requested.connect(self._open_auto_output)
+        dialog.segments_changed.connect(self._on_auto_segments_edited)
         self._center_pane.timeline.position_changed.connect(dialog.set_playhead)
         self._auto_segments_dialog = dialog
+        if pending is not None:
+            self._show_job_in_dialog(pending)
         dialog.show()
+
+    def _on_auto_segments_edited(self, segments) -> None:
+        job = self._active_auto_job
+        if job is None or JobState(job.state) != JobState.AWAITING_REVIEW:
+            return
+        data = [item.to_dict() for item in segments]
+        try:
+            self._active_auto_job = self._automation.transition(
+                job, JobState.AWAITING_REVIEW, segments=data,
+            )
+            self._center_pane.timeline.set_segments(data)
+        except ValueError:
+            pass
+
+    def _restore_auto_job_context(self, job) -> None:
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        if vm is None:
+            return
+        if job.output_dir and os.path.isdir(job.output_dir):
+            # A job owns its output location even if the app-wide setting was
+            # changed between restarts; render checkpoint paths are derived
+            # from this directory.
+            vm.saved_video_path = job.output_dir
+        if (not getattr(vm, 'is_video_loaded', False)
+                or os.path.abspath(str(vm.target_video)) != os.path.abspath(job.video_path)):
+            bus.load_target_video.emit(job.video_path)
+            self._current_media_path = job.video_path
+        thumb_path = self._automation.store.job_dir(job.job_id) / "target.jpg"
+        thumb = cv2.imread(str(thumb_path), cv2.IMREAD_COLOR)
+        if thumb is not None:
+            thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+        else:
+            thumb = np.zeros((64, 64, 3), dtype=np.uint8)
+        slot = {
+            'Embedding': np.asarray(job.target_embedding, dtype=np.float32),
+            'SourceFaceAssignments': list(job.source_labels),
+            'AssignedEmbedding': np.asarray(job.source_embedding, dtype=np.float32),
+            'Thumbnail': thumb,
+            'HFCorrectionGap': None,
+            'HFCorrectionGapSamples': 0,
+            'HFRefinePending': False,
+        }
+        self._found_faces = [slot]
+        self._auto_target_index = 0
+        models = self._get_models()
+        if models is not None:
+            try:
+                models._mean_emb = np.asarray(job.source_embedding, dtype=np.float32)
+            except Exception:
+                pass
+        self._refresh_found_faces_gallery()
+        bus.target_faces.emit(self._found_faces)
+
+    def _show_job_in_dialog(self, job) -> None:
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is None:
+            return
+        if job.segments:
+            try:
+                from rope.AutoSegments import AutoSegment
+                segments = [AutoSegment(**item) for item in job.segments]
+                dialog.set_segments(
+                    segments, self._load_job_thumbnails(job), cached=True,
+                    fps=float(job.video_meta.get('fps', 1.0)),
+                )
+                self._center_pane.timeline.set_segments(job.segments)
+            except (TypeError, ValueError):
+                pass
+        dialog.set_job_state(
+            job.state,
+            job.error or f"Auto Job {job.job_id[:8]} — {job.state}",
+            output=job.final_output,
+        )
+        if job.state in {
+            JobState.SCANNING.value, JobState.RENDERING.value,
+            JobState.MERGING.value, JobState.MUXING.value,
+            JobState.QC.value, JobState.PAUSED.value,
+        }:
+            dialog.resume_button.setEnabled(True)
+
+    def _load_job_thumbnails(self, job) -> dict:
+        result = {}
+        directory = self._automation.store.job_dir(job.job_id) / "thumbnails"
+        for row, _segment in enumerate(job.segments):
+            for label in ('start', 'middle', 'end'):
+                path = directory / f"{row}_{label}.jpg"
+                image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+                if image is not None:
+                    result.setdefault(row, {})[label] = cv2.cvtColor(
+                        image, cv2.COLOR_BGR2RGB,
+                    )
+        return result
+
+    def _save_job_assets(self, job, slot, thumbnails: dict | None = None) -> None:
+        directory = self._automation.store.job_dir(job.job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        thumb = slot.get('Thumbnail')
+        if isinstance(thumb, np.ndarray) and thumb.ndim == 3:
+            cv2.imwrite(
+                str(directory / "target.jpg"),
+                cv2.cvtColor(thumb, cv2.COLOR_RGB2BGR),
+            )
+        if thumbnails:
+            thumbs_dir = directory / "thumbnails"
+            thumbs_dir.mkdir(parents=True, exist_ok=True)
+            for row, images in thumbnails.items():
+                for label, image in images.items():
+                    if isinstance(image, np.ndarray) and image.ndim == 3:
+                        cv2.imwrite(
+                            str(thumbs_dir / f"{row}_{label}.jpg"),
+                            cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                        )
+
+    def _auto_preflight_errors(self, vm, slot) -> list[str]:
+        errors = []
+        output = self.settings.saved_videos
+        if not output or not os.path.isdir(output) or not os.access(output, os.W_OK):
+            errors.append("Output Folder chưa tồn tại hoặc không ghi được")
+        if vm is None or not getattr(vm, 'is_video_loaded', False) \
+                or not os.path.isfile(str(getattr(vm, 'target_video', ''))):
+            errors.append("Video input chưa được tải hoặc không còn tồn tại")
+        if not slot.get('SourceFaceAssignments') or slot.get('AssignedEmbedding') is None:
+            errors.append("Target face chưa được gán source face/embedding")
+        if vm is None or float(getattr(vm, 'fps', 0.0) or 0.0) <= 0 \
+                or int(getattr(vm, 'video_frame_total', 0) or 0) <= 0:
+            errors.append("FPS hoặc tổng frame của video không hợp lệ")
+        try:
+            from rope.VideoManager import _find_ffmpeg
+            if _find_ffmpeg() is None:
+                errors.append("Không tìm thấy FFmpeg để encode/ghép/mux audio")
+        except Exception:
+            errors.append("Không kiểm tra được FFmpeg")
+        models = self._get_models()
+        values = self._params_pane.values
+        if models is None:
+            errors.append("Models backend chưa sẵn sàng")
+        else:
+            try:
+                if not models.swap_pipeline_files_present(
+                    str(values.get('SwapperTypeTextSel', '128')),
+                    str(values.get('DetectTypeTextSel', 'Retinaface')),
+                ):
+                    errors.append("Thiếu detector, recognizer hoặc swapper đang chọn")
+            except Exception as exc:
+                errors.append(f"Không kiểm tra được model pipeline: {exc}")
+            optional = []
+            if values.get('OccluderSwitch'):
+                optional.append(('occluder.onnx', 'Occluder'))
+            if values.get('DFLXSegSwitch'):
+                optional.append(('dfl_xseg.onnx', 'DFL XSeg'))
+            if values.get('FaceParserSwitch'):
+                optional.append(('faceparser_resnet34.onnx', 'Face Parser'))
+            if values.get('RestorerSwitch'):
+                restorer_files = {
+                    'GFPGAN': 'GFPGANv1.4.onnx', 'CF': 'codeformer_fp16.onnx',
+                    'GPEN256': 'GPEN-BFR-256.onnx', 'GPEN512': 'GPEN-BFR-512.onnx',
+                }
+                name = str(values.get('RestorerTypeTextSel', 'GFPGAN'))
+                optional.append((restorer_files.get(name, ''), f'Restorer {name}'))
+            for filename, label in optional:
+                if filename and not os.path.isfile(os.path.join(models.models_folder, filename)):
+                    errors.append(f"Đang bật {label} nhưng thiếu {filename}")
+        if output and os.path.isdir(output) and vm is not None \
+                and os.path.isfile(str(getattr(vm, 'target_video', ''))):
+            try:
+                source_size = os.path.getsize(vm.target_video)
+                required = int(source_size * 2.5 + 256 * 1024 * 1024)
+                if shutil.disk_usage(output).free < required:
+                    errors.append(
+                        f"Không đủ dung lượng trống (cần khoảng {required / 1024**3:.1f} GB)"
+                    )
+            except OSError:
+                errors.append("Không kiểm tra được dung lượng Output Folder")
+        return errors
+
+    def _auto_job_inputs_locked(self) -> bool:
+        job = self._active_auto_job
+        if job is None:
+            return False
+        try:
+            state = JobState(job.state)
+            if state == JobState.FAILED and job.retry_from == JobState.PREFLIGHT.value:
+                return False
+            if state == JobState.PAUSED and job.paused_from == JobState.PREFLIGHT.value:
+                return False
+            return state in {
+                JobState.SCANNING, JobState.AWAITING_REVIEW, JobState.RENDERING,
+                JobState.MERGING, JobState.MUXING, JobState.QC,
+                JobState.PAUSED, JobState.FAILED,
+            }
+        except ValueError:
+            return False
+
+    def _warn_auto_job_locked(self) -> None:
+        QMessageBox.information(
+            self, "Auto Job đang khóa input",
+            "Video, target face và source face được khóa để checkpoint/resume luôn "
+            "dùng đúng identity. Hãy hoàn tất hoặc retry Auto Job hiện tại.",
+        )
 
     def _start_auto_scan(self, sample_interval: float, gap: int, padding: int) -> None:
         vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
         dialog = getattr(self, '_auto_segments_dialog', None)
         if vm is None or dialog is None or not getattr(vm, 'is_video_loaded', False):
             if dialog is not None:
-                dialog.set_error("Hãy tải video trước khi quét.")
+                dialog.set_job_state("NEW", "Hãy tải video trước khi bắt đầu Auto Job.")
+            return
+        if (not self._found_faces or not hasattr(self, '_auto_target_index')
+                or not (0 <= self._auto_target_index < len(self._found_faces))):
+            dialog.set_job_state("NEW", "Hãy Find Faces, chọn target và gán source trước.")
+            return
+        existing = self._automation.store.latest_resumable()
+        if existing is not None:
+            self._active_auto_job = existing
+            self._restore_auto_job_context(existing)
+            self._show_job_in_dialog(existing)
+            dialog.status.setText(
+                "Chỉ một GPU job được phép hoạt động. Hãy Resume/Retry job hiện tại."
+            )
             return
         if self._is_playing or self._is_recording:
             bus.play_video.emit('stop_from_gui')
             self._is_playing = self._is_recording = False
         slot = self._found_faces[self._auto_target_index]
-        if not slot.get('SourceFaceAssignments') or slot.get('AssignedEmbedding') is None:
-            dialog.set_error("Hãy gán source face/embedding cho nhân vật trước khi quét.")
+        errors = self._auto_preflight_errors(vm, slot)
+        if errors:
+            message = "Preflight thất bại:\n• " + "\n• ".join(errors)
+            dialog.set_job_state("NEW", message)
             return
         threshold = float(self._params_pane.values.get('ThresholdSlider', 55))
+        scan_config = {
+            'sample_interval_seconds': float(sample_interval),
+            'gap_frames': int(gap), 'padding_frames': int(padding),
+            'threshold': threshold, 'chunk_seconds': 300,
+            'refine_radius_seconds': 1.0, 'refine_stride_frames': 3,
+            'near_hit_margin': 8.0,
+            'detector': str(self._params_pane.values.get('DetectTypeTextSel', 'Retinaface')),
+            'detect_score': float(self._params_pane.values.get('DetectScoreSlider', 50)),
+            'input_size': int(self._params_pane.values.get('DetectInputSizeTextSel', 640)),
+            'algorithm_version': 3,
+        }
+        request = {
+            'video_path': vm.target_video,
+            'output_dir': self.settings.saved_videos or '',
+            'video_fingerprint': fingerprint_video(vm.target_video),
+            'video_meta': {
+                'fps': float(vm.fps), 'total_frames': int(vm.video_frame_total),
+                'width': int(vm.player.width), 'height': int(vm.player.height),
+            },
+            'target_embedding': np.asarray(slot['Embedding']).reshape(-1).tolist(),
+            'source_embedding': np.asarray(slot.get('AssignedEmbedding')).reshape(-1).tolist(),
+            'source_labels': list(slot.get('SourceFaceAssignments') or []),
+            'scan_config': scan_config,
+            'render_params': dict(self._params_pane.values),
+        }
+        job = self._automation.start_job(request)
+        self._active_auto_job = job
+        self._save_job_assets(job, slot)
+        self._center_pane.set_auto_job_pending(True)
+        self._active_auto_job = self._automation.begin_scan(job)
+        self._params_pane.setEnabled(False)
+        dialog.set_job_state("SCANNING", "Preflight thành công. Đang scan…")
+        self._launch_auto_scan(self._active_auto_job)
+
+    def _launch_auto_scan(self, job) -> None:
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if vm is None or dialog is None:
+            return
+        config = job.scan_config
         self._auto_scan_cancel = threading.Event()
         cache_dir = os.path.join(QStandardPaths.writableLocation(QStandardPaths.CacheLocation),
                                  'auto_segments')
         worker = _AutoScanWorker(
-            vm, slot['Embedding'], threshold, sample_interval, gap, padding,
+            vm, np.asarray(job.target_embedding, dtype=np.float32),
+            float(config.get('threshold', 55)),
+            float(config.get('sample_interval_seconds', 0.5)),
+            int(config.get('gap_frames', 20)),
+            int(config.get('padding_frames', 10)),
             cache_dir, self._auto_scan_cancel,
         )
         worker.signals.progress.connect(dialog.set_scan_progress)
+        worker.signals.checkpoint.connect(self._on_auto_scan_checkpoint)
         worker.signals.finished.connect(self._on_auto_scan_finished)
-        worker.signals.failed.connect(dialog.set_error)
+        worker.signals.failed.connect(self._on_auto_scan_failed)
         self._auto_scan_worker = worker
         QThreadPool.globalInstance().start(worker)
 
+    def _on_auto_scan_checkpoint(self, checkpoint: dict) -> None:
+        job = self._active_auto_job
+        if job is None or JobState(job.state) != JobState.SCANNING:
+            return
+        try:
+            self._active_auto_job = self._automation.transition(
+                job, JobState.SCANNING, scan_checkpoint=dict(checkpoint),
+            )
+        except ValueError:
+            pass
+
     def _cancel_auto_scan(self) -> None:
+        self._pause_auto_job()
+
+    def _on_auto_scan_failed(self, message: str) -> None:
+        job = self._active_auto_job
         event = getattr(self, '_auto_scan_cancel', None)
-        if event is not None:
-            event.set()
+        cancelled = bool(event is not None and event.is_set())
+        if job is not None:
+            try:
+                if cancelled:
+                    job = self._automation.pause_job(job)
+                else:
+                    job = self._automation.fail_job(
+                        job, message, retry_from=JobState.SCANNING,
+                    )
+                self._active_auto_job = job
+            except ValueError:
+                pass
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_job_state("PAUSED" if cancelled else "FAILED", message)
+        self._params_pane.setEnabled(True)
+        self._center_pane.set_auto_job_pending(True)
 
     def _on_auto_scan_finished(self, result) -> None:
         segments = result['segments']
+        job = self._active_auto_job
+        if job is not None:
+            try:
+                job = self._automation.set_scan_results(
+                    job, [item.to_dict() for item in segments],
+                )
+                self._active_auto_job = job
+                self._save_job_assets(
+                    job, self._found_faces[self._auto_target_index],
+                    result.get('thumbnails'),
+                )
+            except ValueError as exc:
+                self._on_auto_scan_failed(str(exc))
+                return
         dialog = getattr(self, '_auto_segments_dialog', None)
         if dialog is not None:
-            dialog.set_segments(segments, result.get('thumbnails'), cached=result.get('cached', False))
+            dialog.set_segments(
+                segments, result.get('thumbnails'),
+                cached=result.get('cached', False), fps=float(getattr(
+                    getattr(self._coordinator, 'vm', None), 'fps', 1.0,
+                )),
+            )
+        self._params_pane.setEnabled(True)
         self._center_pane.timeline.set_segments([item.to_dict() for item in segments])
 
     def _start_auto_render(self, segments) -> None:
         ranges = approved_ranges(segments)
         if not ranges:
             return
-        if not self.settings.saved_videos:
-            QMessageBox.warning(self, "Auto Segments", "Hãy chọn Output folder trước.")
+        job = self._active_auto_job
+        if job is None:
+            QMessageBox.warning(self, "Auto Job", "Không tìm thấy job đang chờ duyệt.")
             return
+        if not job.output_dir or not os.path.isdir(job.output_dir):
+            QMessageBox.warning(self, "Auto Job", "Output Folder của job không còn tồn tại.")
+            return
+        try:
+            if fingerprint_video(job.video_path) != job.video_fingerprint:
+                raise ValueError("Video input đã thay đổi sau khi scan; cần quét lại job.")
+        except (OSError, ValueError) as exc:
+            self._active_auto_job = self._automation.fail_job(
+                job, str(exc), retry_from=JobState.PREFLIGHT,
+            )
+            dialog = getattr(self, '_auto_segments_dialog', None)
+            if dialog is not None:
+                dialog.set_job_state("FAILED", str(exc))
+            return
+        try:
+            job = self._automation.confirm_segments(
+                job, [item.to_dict() for item in segments],
+                dict(self._params_pane.values),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Auto Job", str(exc))
+            return
+        self._active_auto_job = job
+        self._params_pane.setEnabled(False)
+        bus.parameters_changed.emit(dict(job.render_params))
         self._center_pane.timeline.set_segments([item.to_dict() for item in segments])
-        bus.auto_render_segments.emit(ranges)
+        bus.auto_render_segments.emit(self._auto_render_request(job, ranges))
+        if (self._active_auto_job is None
+                or JobState(self._active_auto_job.state) != JobState.RENDERING):
+            return
         self._is_playing = True
         self._is_recording = True
         self._center_pane.set_play_state(True)
         self._center_pane.set_record_state(True)
         dialog = getattr(self, '_auto_segments_dialog', None)
         if dialog is not None:
-            dialog.status.setText("Đang render… Có thể bấm Hủy render để lưu checkpoint.")
+            dialog.set_job_state("RENDERING", "Đang render part đầu tiên…")
+
+    def _auto_render_request(self, job, ranges=None) -> dict:
+        source_label = os.path.splitext(os.path.basename(job.source_labels[0]))[0] \
+            if job.source_labels else "source"
+        return {
+            'ranges': list(ranges if ranges is not None else approved_ranges(job.segments)),
+            'job_id': job.job_id, 'source_label': source_label,
+            'part_seconds': 60, 'render_params': dict(job.render_params),
+        }
 
     def _cancel_auto_render(self) -> None:
-        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
-        if vm is not None:
-            vm.cancel_auto_segment_render()
-            dialog = getattr(self, '_auto_segments_dialog', None)
-            if dialog is not None:
-                dialog.status.setText("Đang đóng part hiện tại và lưu checkpoint…")
+        self._pause_auto_job()
 
     def _resume_auto_render(self) -> None:
-        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
-        if vm is not None:
-            vm.resume_auto_segment_render()
-            self._is_playing = True
-            self._is_recording = True
-            self._center_pane.set_play_state(True)
-            self._center_pane.set_record_state(True)
+        self._resume_auto_job()
+
+    def _pause_auto_job(self) -> None:
+        job = self._active_auto_job
+        if job is None:
+            return
+        state = JobState(job.state)
+        if state == JobState.SCANNING:
+            event = getattr(self, '_auto_scan_cancel', None)
+            if event is not None:
+                event.set()
+        elif state == JobState.RENDERING:
+            vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+            if vm is not None:
+                vm.cancel_auto_segment_render()
+        else:
+            try:
+                self._active_auto_job = self._automation.pause_job(job)
+            except ValueError:
+                return
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.status.setText("Đang dừng an toàn và lưu checkpoint…")
+            dialog.pause_button.setEnabled(False)
+
+    def _resume_auto_job(self) -> None:
+        job = self._active_auto_job or self._automation.store.latest_resumable()
+        if job is None:
+            return
+        try:
+            if JobState(job.state) in (JobState.PAUSED, JobState.FAILED):
+                job = self._automation.resume_job(job.job_id)
+        except ValueError as exc:
             dialog = getattr(self, '_auto_segments_dialog', None)
             if dialog is not None:
-                dialog.status.setText("Đang tiếp tục render từ checkpoint…")
+                dialog.set_error(str(exc))
+            return
+        self._active_auto_job = job
+        self._restore_auto_job_context(job)
+        state = JobState(job.state)
+        if state in (JobState.SCANNING, JobState.AWAITING_REVIEW):
+            try:
+                changed = fingerprint_video(job.video_path) != job.video_fingerprint
+            except OSError:
+                changed = True
+            if changed:
+                message = "Video input đã thay đổi; bấm Retry để preflight và scan lại."
+                self._active_auto_job = self._automation.fail_job(
+                    job, message, retry_from=JobState.PREFLIGHT,
+                )
+                self._show_job_in_dialog(self._active_auto_job)
+                return
+        if state == JobState.PREFLIGHT:
+            errors = self._auto_preflight_errors(
+                getattr(self._coordinator, 'vm', None), self._found_faces[0],
+            )
+            if errors:
+                self._active_auto_job = self._automation.fail_job(
+                    job, "Preflight thất bại:\n• " + "\n• ".join(errors),
+                    retry_from=JobState.PREFLIGHT,
+                )
+                self._show_job_in_dialog(self._active_auto_job)
+                return
+            job = self._automation.transition(
+                job, JobState.PREFLIGHT,
+                output_dir=self.settings.saved_videos or job.output_dir,
+                render_params=dict(self._params_pane.values),
+                video_fingerprint=fingerprint_video(job.video_path),
+                video_meta={
+                    'fps': float(self._coordinator.vm.fps),
+                    'total_frames': int(self._coordinator.vm.video_frame_total),
+                    'width': int(self._coordinator.vm.player.width),
+                    'height': int(self._coordinator.vm.player.height),
+                },
+                segments=[], user_confirmed=False, scan_checkpoint={},
+            )
+            job = self._automation.begin_scan(job)
+            self._active_auto_job = job
+            self._params_pane.setEnabled(False)
+            self._launch_auto_scan(job)
+        elif state == JobState.SCANNING:
+            self._params_pane.setEnabled(False)
+            dialog = getattr(self, '_auto_segments_dialog', None)
+            if dialog is not None:
+                dialog.set_job_state("SCANNING", "Đang tiếp tục scan từ checkpoint…")
+            self._launch_auto_scan(job)
+        elif state == JobState.AWAITING_REVIEW:
+            self._show_job_in_dialog(job)
+        elif state in (JobState.RENDERING, JobState.MERGING, JobState.MUXING):
+            vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+            if vm is not None:
+                self._params_pane.setEnabled(state != JobState.RENDERING)
+                if state == JobState.RENDERING:
+                    self._is_playing = self._is_recording = True
+                    self._center_pane.set_play_state(True)
+                    self._center_pane.set_record_state(True)
+                    dialog = getattr(self, '_auto_segments_dialog', None)
+                    if dialog is not None:
+                        dialog.set_job_state("RENDERING", "Đang tiếp tục render từ checkpoint…")
+                manifest_path = vm._auto_manifest_for_video(job.job_id)
+                if os.path.isfile(manifest_path):
+                    vm.resume_auto_segment_render(job.job_id)
+                else:
+                    bus.auto_render_segments.emit(self._auto_render_request(job))
+        elif state == JobState.QC and job.final_output:
+            self._start_auto_qc(job.final_output)
+
+    def _retry_auto_job(self) -> None:
+        self._resume_auto_job()
+
+    def _open_auto_output(self) -> None:
+        job = self._active_auto_job
+        path = job.final_output if job and job.final_output else None
+        if path:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
+
+    def _preview_auto_segment(self, start: int, end: int) -> None:
+        self._auto_previewing = True
+        bus.set_stop.emit(int(end))
+        self._seek_to_frame(int(start))
+        bus.play_video.emit('play')
+        self._is_playing = True
+        self._center_pane.set_play_state(True)
+
+    def _on_auto_render_progress(self, data) -> None:
+        payload = dict(data)
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_render_progress(payload)
+        job = self._active_auto_job
+        part = int(payload.get('part', 0))
+        if (job is not None and JobState(job.state) == JobState.RENDERING
+                and part != getattr(self, '_auto_job_checkpoint_part', -1)):
+            self._auto_job_checkpoint_part = part
+            try:
+                self._active_auto_job = self._automation.transition(
+                    job, JobState.RENDERING, render_checkpoint=payload,
+                )
+            except ValueError:
+                pass
+
+    def _on_auto_render_stage(self, stage: str) -> None:
+        job = self._active_auto_job
+        if job is None:
+            return
+        try:
+            target = JobState(stage)
+            if target == JobState.PAUSED:
+                job = self._automation.pause_job(job)
+            else:
+                job = self._automation.transition(job, target)
+            self._active_auto_job = job
+        except (ValueError, KeyError):
+            return
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_job_state(job.state, f"Auto Job: {job.state}")
+        if JobState(job.state) != JobState.RENDERING:
+            self._params_pane.setEnabled(True)
+
+    def _on_auto_render_finished(self, final_output: str) -> None:
+        self._is_playing = False
+        self._is_recording = False
+        self._record_armed = False
+        self._center_pane.set_play_state(False)
+        self._center_pane.set_record_state(False)
+        self._params_pane.setEnabled(True)
+        job = self._active_auto_job
+        if job is None:
+            return
+        try:
+            job = self._automation.transition(
+                job, JobState.QC, final_output=str(final_output),
+            )
+            self._active_auto_job = job
+        except ValueError as exc:
+            self._on_auto_render_failed(str(exc))
+            return
+        self._start_auto_qc(final_output)
+
+    def _on_auto_render_failed(self, message: str) -> None:
+        self._is_playing = False
+        self._is_recording = False
+        self._record_armed = False
+        self._center_pane.set_play_state(False)
+        self._center_pane.set_record_state(False)
+        self._params_pane.setEnabled(True)
+        job = self._active_auto_job
+        if job is not None:
+            try:
+                self._active_auto_job = self._automation.fail_job(
+                    job, message, retry_from=JobState.RENDERING,
+                )
+            except ValueError:
+                pass
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_job_state("FAILED", message)
+
+    def _start_auto_qc(self, final_output: str) -> None:
+        job = self._active_auto_job
+        vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+        if job is None or vm is None:
+            return
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_job_state("QC", "Đang kiểm tra duration, audio, frame và identity…")
+        worker = _AutoQCWorker(vm, job, final_output)
+        worker.signals.finished.connect(self._on_auto_qc_finished)
+        worker.signals.failed.connect(self._on_auto_qc_failed)
+        self._auto_qc_worker = worker
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_auto_qc_finished(self, qc: dict) -> None:
+        job = self._active_auto_job
+        if job is None:
+            return
+        if qc.get('passed'):
+            try:
+                job = self._automation.complete_job(
+                    job, job.final_output or '', qc,
+                )
+                self._active_auto_job = job
+            except ValueError as exc:
+                self._on_auto_qc_failed(str(exc))
+                return
+            vm = getattr(getattr(self, '_coordinator', None), 'vm', None)
+            if vm is not None:
+                vm.complete_auto_render_cleanup(job.job_id)
+            self._center_pane.set_auto_job_pending(False)
+            dialog = getattr(self, '_auto_segments_dialog', None)
+            if dialog is not None:
+                warning_note = ""
+                if qc.get('warnings'):
+                    warning_note = " — " + "; ".join(qc['warnings'])
+                dialog.set_job_state(
+                    "COMPLETED", f"Hoàn tất QC{warning_note}",
+                    output=job.final_output,
+                )
+            QMessageBox.information(
+                self, "Auto Job hoàn tất",
+                f"Video đã được render và QC:\n{job.final_output}",
+            )
+        else:
+            message = "QC không đạt: " + "; ".join(qc.get('failures') or ['unknown'])
+            try:
+                job.qc = dict(qc)
+                self._active_auto_job = self._automation.fail_job(
+                    job, message, retry_from=JobState.QC,
+                )
+            except ValueError:
+                pass
+            dialog = getattr(self, '_auto_segments_dialog', None)
+            if dialog is not None:
+                dialog.set_job_state("FAILED", message, output=job.final_output)
+
+    def _on_auto_qc_failed(self, message: str) -> None:
+        job = self._active_auto_job
+        if job is not None:
+            try:
+                self._active_auto_job = self._automation.fail_job(
+                    job, message, retry_from=JobState.QC,
+                )
+            except ValueError:
+                pass
+        dialog = getattr(self, '_auto_segments_dialog', None)
+        if dialog is not None:
+            dialog.set_job_state("FAILED", message, output=(
+                job.final_output if job else None
+            ))
 
     def _on_play_pressed(self) -> None:
+        job = self._active_auto_job
+        if job is not None:
+            state = JobState(job.state)
+            if state == JobState.RENDERING:
+                self._pause_auto_job()
+                return
+            if state in {JobState.SCANNING, JobState.MERGING, JobState.MUXING, JobState.QC}:
+                self._tooltip_label.setText(f"Auto Job đang {state.value}; transport tạm khóa.")
+                return
         # The preview canvas is wired to this handler too, so clicking the
         # output window during a recording routes here and stops it.
         if self._is_recording:
@@ -792,6 +1681,15 @@ class MainWindow(QMainWindow):
         self._center_pane.set_record_state(self._is_recording or self._record_armed)
 
     def _on_record_pressed(self) -> None:
+        job = self._active_auto_job
+        if job is not None:
+            state = JobState(job.state)
+            if state == JobState.RENDERING:
+                self._pause_auto_job()
+                return
+            if state in {JobState.SCANNING, JobState.MERGING, JobState.MUXING, JobState.QC}:
+                self._tooltip_label.setText(f"Auto Job đang {state.value}; Record tạm khóa.")
+                return
         if self._is_recording:
             # Actively recording → stop and finalize (same as Play here).
             bus.play_video.emit("stop_from_gui")
@@ -837,6 +1735,9 @@ class MainWindow(QMainWindow):
         self._record_armed = False
         self._center_pane.set_play_state(False)
         self._center_pane.set_record_state(False)
+        if getattr(self, '_auto_previewing', False):
+            self._auto_previewing = False
+            bus.set_stop.emit(-1)
 
     def _seek_to_frame(self, frame: int) -> None:
         """Move the timeline scrubber AND request the frame from VM.
@@ -1002,6 +1903,9 @@ class MainWindow(QMainWindow):
         return out
 
     def _on_find_faces(self) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         # Run detect+recognize on the currently displayed preview frame
         # and append any *new* faces — existing entries are preserved
         # (along with their SourceFaceAssignments). A detection is
@@ -1082,6 +1986,9 @@ class MainWindow(QMainWindow):
             )
 
     def _on_clear_faces(self) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         self._found_faces = []
         self._refresh_found_faces_gallery()
         self._center_pane.found_faces_gallery.set_selected(-1)
@@ -1107,6 +2014,9 @@ class MainWindow(QMainWindow):
             del idx  # tile index matches list index by construction
 
     def _on_found_face_clicked(self, index: int) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         """Select a target slot and apply any already-selected source.
 
         Both natural interaction orders must work:
@@ -1206,6 +2116,9 @@ class MainWindow(QMainWindow):
     # ----- Embeddings pane callbacks ---------------------------------------------
 
     def _on_embedding_selection_activated(self, entries) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         """Apply the picked embedding(s) to the currently-selected
         Found Face. With ExtendedSelection on the embeddings list,
         ctrl/shift+click can build a multi-selection; merging across
@@ -1388,6 +2301,9 @@ class MainWindow(QMainWindow):
         self._tooltip_label.setText(f"Loaded {self._faces_panel.list.count()} face images")
 
     def _on_target_media_clicked(self, path: str) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         suffix = path.lower().rsplit(".", 1)[-1] if "." in path else ""
         if suffix in {"jpg", "jpeg", "png", "bmp", "webp"}:
             bus.load_target_image.emit(path)
@@ -1403,6 +2319,9 @@ class MainWindow(QMainWindow):
         self._tooltip_label.setText(f"Loading: {path}")
 
     def _on_source_face_selection_changed(self, paths: list) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         """Driven by the source-faces list's native selection model.
         Computes embeddings for any newly-selected paths, then applies
         the combined embedding to the currently-selected Found Face.
@@ -1598,6 +2517,9 @@ class MainWindow(QMainWindow):
         self._tooltip_label.setText(f"Saved {filename}")
 
     def _on_pick_output_folder(self, *_args) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         start = self.settings.saved_videos or ""
         path = QFileDialog.getExistingDirectory(self, "Select Output Folder", start)
         if not path:
@@ -1608,6 +2530,9 @@ class MainWindow(QMainWindow):
         bus.saved_video_path.emit(path)
 
     def _on_pick_models_folder(self) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         start = self.settings.models_folder or ""
         path = QFileDialog.getExistingDirectory(self, "Select Models Folder", start)
         if not path:
@@ -1649,6 +2574,9 @@ class MainWindow(QMainWindow):
         self._center_pane.embeddings_pane.set_source_path(path)
 
     def _on_clear_vram(self, *_args) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         coord = getattr(self, "_coordinator", None) or getattr(self, "_coordinator_ref", None)
         models = getattr(coord, "models", None) if coord is not None else None
         if models is None or not hasattr(models, "delete_models"):
@@ -1663,6 +2591,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_model_unload(self, attr_name: str) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         coord = getattr(self, "_coordinator", None)
         models = getattr(coord, "models", None) if coord is not None else None
         if models is None or not hasattr(models, "unload_model"):
@@ -1677,6 +2608,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str)
     def _on_model_backend_changed(self, attr_name: str, backend: str) -> None:
+        if self._auto_job_inputs_locked():
+            self._warn_auto_job_locked()
+            return
         coord = getattr(self, "_coordinator", None)
         models = getattr(coord, "models", None) if coord is not None else None
         if models is None or not hasattr(models, "set_backend_preference"):

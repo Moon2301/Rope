@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import os
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-SCAN_CACHE_VERSION = 2
+SCAN_CACHE_VERSION = 3
 
 
 class SequentialScanDecoder:
@@ -74,11 +74,17 @@ class AutoSegment:
     end_frame: int
     confidence: float
     approved: bool = True
+    hit_count: int = 0
+    review_required: bool = False
+    review_reasons: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.start_frame = max(0, int(self.start_frame))
         self.end_frame = max(self.start_frame, int(self.end_frame))
         self.confidence = max(0.0, min(100.0, float(self.confidence)))
+        self.hit_count = max(0, int(self.hit_count))
+        self.review_required = bool(self.review_required)
+        self.review_reasons = [str(item) for item in self.review_reasons]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -112,7 +118,32 @@ def group_matches(
             max(0, group[0][0] - pad),
             min(last_frame, group[-1][0] + max(1, int(stride)) - 1 + pad),
             sum(c for _, c in group) / len(group),
+            hit_count=len(group),
         ))
+    return result
+
+
+def mark_segments_for_review(segments: Iterable[AutoSegment], *, threshold: float,
+                             fps: float) -> list[AutoSegment]:
+    """Annotate borderline/short/single-hit ranges without rejecting them.
+
+    The user confirmation gate remains mandatory for every job; these flags
+    merely direct attention to the rows most likely to need an edit.
+    """
+    result = []
+    safe_fps = max(0.001, float(fps))
+    for segment in segments:
+        reasons = []
+        if segment.confidence < float(threshold) + 5.0:
+            reasons.append("confidence sát threshold")
+        duration = (segment.end_frame - segment.start_frame + 1) / safe_fps
+        if duration < 0.7:
+            reasons.append("segment ngắn dưới 0,7 giây")
+        if segment.hit_count <= 1:
+            reasons.append("chỉ có một hit")
+        segment.review_reasons = reasons
+        segment.review_required = bool(reasons)
+        result.append(segment)
     return result
 
 
