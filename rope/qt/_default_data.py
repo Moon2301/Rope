@@ -229,6 +229,8 @@ DEFAULT_DATA = {
 
 'OrientAutoSwitchInfoText':         'AUTO ORIENTATION:\nDetect face orientation automatically. On the first frame of a video (and whenever detection fails for several frames) the detector is probed at 0/90/180/270; the winning rotation is cached for subsequent frames. Fine-tuned per-frame from the detected eye axis. Overrides the manual Orientation slider when on.',
 'OrientAutoSwitchState':            False,
+'TemporalTrackingSwitchInfoText':   'TEMPORAL STABILIZATION:\nTracks the assigned face across video frames and adaptively smooths its 5-point alignment. Reduces landmark jitter and identity hopping, and safely predicts at most one missed detector frame. Applies to video preview and recording; images and Capture are unchanged.',
+'TemporalTrackingSwitchState':      True,
 'RestorerSwitchInfoText':           'FACE RESTORER:\nRestore the swapped image by upscaling.',
 'RestorerSwitchState':              False,
 'StrengthSwitchInfoText':           'SWAPPER STRENGTH:\nApply additional swapping iterations to increase the strength of the result, which may increase likeness',

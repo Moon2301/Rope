@@ -16,6 +16,7 @@ import hashlib
 
 from rope.qt.bus import bus
 from rope._nvtx import nvtx_range
+from rope.FaceTracking import TRACKING_VERSION, TemporalFaceTracker, make_slot_key
 
 
 _FFMPEG_PATH_CACHE = None
@@ -243,6 +244,12 @@ class VideoManager():
         self.auto_render_started_at = None
         self.auto_render_last_progress_frame = -1
         self.auto_render_parameters = None
+        self.auto_render_processing_error = None
+        # Five-point temporal alignment. Detection/recognition remain parallel;
+        # this coordinator only orders the small CPU association/filter step.
+        self.temporal_tracker = TemporalFaceTracker()
+        self._tracking_generation = None
+        self._temporal_signature_indices = {}
         # One-shot numerical diagnostic for reports where the model loads
         # successfully but the preview looks unchanged/garbled.
         self._swap_diag_done = False
@@ -754,6 +761,52 @@ class VideoManager():
     def assign_found_faces(self, found_faces):
         self.found_faces = found_faces
 
+    @staticmethod
+    def _temporal_tracking_enabled(parameters):
+        return bool((parameters or {}).get('TemporalTrackingSwitch', False))
+
+    def _start_temporal_sequence(self, start_frame, parameters, checkpoint=None):
+        if not self._temporal_tracking_enabled(parameters):
+            self.temporal_tracker.abort_sequence(self._tracking_generation)
+            self._tracking_generation = None
+            return None
+        safe_start = max(0, int(start_frame))
+        self._tracking_generation = self.temporal_tracker.start_sequence(
+            safe_start, float(self.fps), checkpoint,
+        )
+        return self._tracking_generation
+
+    def _abort_temporal_sequence(self):
+        if self._tracking_generation is not None:
+            self.temporal_tracker.abort_sequence(self._tracking_generation)
+        self._tracking_generation = None
+
+    def _temporal_frame_signature(self, img):
+        """Return a tiny uint8 luma image for conservative scene-cut resets."""
+        # Sample before casting so this does not allocate a full-resolution
+        # float copy merely to produce 576 bytes of scene metadata.
+        key = (str(img.device), int(img.shape[1]), int(img.shape[2]))
+        indices = self._temporal_signature_indices.get(key)
+        if indices is None:
+            y_index = torch.linspace(
+                0, max(0, int(img.shape[1]) - 1), 18,
+                device=img.device,
+            ).round().to(torch.long)
+            x_index = torch.linspace(
+                0, max(0, int(img.shape[2]) - 1), 32,
+                device=img.device,
+            ).round().to(torch.long)
+            indices = (y_index, x_index)
+            self._temporal_signature_indices[key] = indices
+        y_index, x_index = indices
+        value = img.index_select(1, y_index).index_select(2, x_index).to(torch.float32)
+        luma = (
+            value[0] * 0.299
+            + value[1] * 0.587
+            + value[2] * 0.114
+        )
+        return luma.clamp(0, 255).to(torch.uint8).cpu().numpy()
+
     def start_auto_segment_render(self, request):
         """Start a persistent, minute-part Auto Job render.
 
@@ -805,7 +858,7 @@ class VideoManager():
         )))
         stat = os.stat(self.target_video)
         self._write_auto_render_manifest({
-            'version': 2, 'job_id': job_id,
+            'version': 3, 'job_id': job_id,
             'video': os.path.abspath(self.target_video),
             'video_size': int(stat.st_size), 'video_mtime_ns': int(stat.st_mtime_ns),
             'ranges': self.auto_segment_ranges, 'parts': [], 'next_frame': 0,
@@ -813,6 +866,8 @@ class VideoManager():
             'final_output': final_output, 'stage': 'RENDERING',
             'encoder': 'h264_nvenc' if _ffmpeg_has_working_nvenc(ffmpeg_exe) else 'libx264',
             'render_params': self.auto_render_parameters,
+            'tracking_version': TRACKING_VERSION,
+            'tracking_checkpoint': None,
         })
         self.auto_render_started_at = time.perf_counter()
         self.auto_render_last_progress_frame = -1
@@ -859,6 +914,7 @@ class VideoManager():
                 item.get('Status') in ('started', 'finished')
                 for item in self.process_qs
             ):
+                self._abort_temporal_sequence()
                 try:
                     self.sp.stdin.close()
                     self.sp.wait(timeout=10)
@@ -893,6 +949,10 @@ class VideoManager():
             return
         self.auto_segment_ranges = [tuple(item) for item in manifest.get('ranges', [])]
         self.auto_render_parameters = dict(manifest.get('render_params') or self.parameters)
+        if 'TemporalTrackingSwitch' not in self.auto_render_parameters:
+            # Jobs created before temporal tracking may already contain parts
+            # rendered with raw landmarks. Preserve their original geometry.
+            self.auto_render_parameters['TemporalTrackingSwitch'] = False
         self.auto_render_active = True
         self.auto_render_cancel_requested = False
         self.auto_render_started_at = time.perf_counter()
@@ -922,6 +982,7 @@ class VideoManager():
         self.auto_current_part_final = os.path.join(work_dir, f'part{part_index:05d}.mp4')
         self.auto_current_part_temp = os.path.join(work_dir, f'part{part_index:05d}.tmp.mp4')
         self.auto_render_write_error = None
+        self.auto_render_processing_error = None
         try:
             os.remove(self.auto_current_part_temp)
         except OSError:
@@ -946,10 +1007,28 @@ class VideoManager():
         manifest['parts'] = parts
         manifest['next_frame'] = int(last_frame) + 1
         manifest['current_part'] = None
+        if self._temporal_tracking_enabled(self.auto_render_parameters):
+            manifest['tracking_version'] = TRACKING_VERSION
+            manifest['tracking_checkpoint'] = self.temporal_tracker.export_checkpoint()
         self._write_auto_render_manifest(manifest)
+        total_parts = int(ceil(
+            self.video_frame_total / max(1, int(manifest.get('part_frames', 1)))
+        ))
+        bus.auto_render_progress.emit({
+            'frame': int(last_frame),
+            'frames': int(self.video_frame_total),
+            'part': len(parts),
+            'parts': total_parts,
+            'percent': min(100.0, 100.0 * (int(last_frame) + 1) / max(1, self.video_frame_total)),
+            'eta_seconds': 0,
+            'checkpoint_complete': True,
+            'tracking_version': manifest.get('tracking_version'),
+            'tracking_checkpoint': manifest.get('tracking_checkpoint'),
+        })
         return manifest
 
     def _schedule_auto_finalize(self, manifest):
+        self._abort_temporal_sequence()
         self.auto_render_active = False
         thread = threading.Thread(
             target=self._finish_auto_render_parts, args=(dict(manifest),),
@@ -1246,6 +1325,9 @@ class VideoManager():
             self.fps_average = []
             self.process_qs = []
             self.frame_timer = time.time()
+            self._start_temporal_sequence(
+                self.current_frame, self.parameters,
+            )
 
             # Create reusable queue based on number of threads
             self._ensure_executor(self.parameters['ThreadsSlider'])
@@ -1263,6 +1345,7 @@ class VideoManager():
 
         elif command == "stop":
             self.play = False
+            self._abort_temporal_sequence()
             bus.stop_play.emit()
 
             index, min_frame = self.find_lowest_frame(self.process_qs)
@@ -1282,6 +1365,7 @@ class VideoManager():
 
         elif command=='stop_from_gui':
             self.play = False
+            self._abort_temporal_sequence()
 
             # Find the lowest frame in the current render queue and set the current frame to the one before it
             index, min_frame = self.find_lowest_frame(self.process_qs)
@@ -1310,6 +1394,13 @@ class VideoManager():
                 else self.parameters
             )
             record_threads = max(1, int(record_params.get('ThreadsSlider', 1)))
+            tracking_checkpoint = None
+            if self.auto_render_active and self.auto_render_manifest_path:
+                tracking_manifest = self._read_auto_render_manifest() or {}
+                tracking_checkpoint = tracking_manifest.get('tracking_checkpoint')
+            self._start_temporal_sequence(
+                self.current_frame, record_params, tracking_checkpoint,
+            )
             self._ensure_executor(record_threads)
             for i in range(record_threads):
                     new_process_q = self.process_q.copy()
@@ -1437,6 +1528,7 @@ class VideoManager():
                         item['BenchStart'] = time.perf_counter()
                     item['Thread'] = self._executor.submit(
                         self.thread_video_read, frame, frame_number,
+                        self._tracking_generation,
                     )
                     # Keep current_frame as the "next frame to dispatch"
                     # marker for stop()'s find_lowest_frame fallback.
@@ -1603,7 +1695,10 @@ class VideoManager():
                                     f'FFmpeg encoder exited with code {return_code}'
                                 )
                                 manifest = self._read_auto_render_manifest() or {}
-                                if getattr(self, 'auto_render_encoder', '') == 'h264_nvenc':
+                                if (
+                                    getattr(self, 'auto_render_encoder', '') == 'h264_nvenc'
+                                    and not self.auto_render_processing_error
+                                ):
                                     # The capability probe passed but the live
                                     # encode can still fail (driver reset, NVENC
                                     # session limit, VRAM pressure). Retry this
@@ -1623,6 +1718,7 @@ class VideoManager():
                                     manifest['error'] = message
                                     self._write_auto_render_manifest(manifest)
                                     self.auto_render_active = False
+                                    self._abort_temporal_sequence()
                                     bus.auto_render_failed.emit(message)
                             else:
                                 try:
@@ -1632,6 +1728,7 @@ class VideoManager():
                                     )
                                 except OSError as exc:
                                     self.auto_render_active = False
+                                    self._abort_temporal_sequence()
                                     bus.auto_render_failed.emit(
                                         f'Could not finalize render part: {exc}'
                                     )
@@ -1645,6 +1742,7 @@ class VideoManager():
                                             manifest['stage'] = 'PAUSED'
                                             self._write_auto_render_manifest(manifest)
                                             self.auto_render_active = False
+                                            self._abort_temporal_sequence()
                                             bus.auto_render_stage.emit('PAUSED')
                                             bus.stop_play.emit()
                                         elif int(manifest.get('next_frame', 0)) >= self.video_frame_total:
@@ -1706,7 +1804,32 @@ class VideoManager():
                     if 'next_manifest' in locals() and next_manifest is not None:
                         self._start_auto_render_part(next_manifest)
     # @profile
-    def thread_video_read(self, target_image, frame_number):
+    def thread_video_read(self, target_image, frame_number, tracking_generation=None):
+        try:
+            return self._thread_video_read_inner(
+                target_image, frame_number, tracking_generation,
+            )
+        except Exception as exc:
+            import traceback
+            error = f'{type(exc).__name__}: {exc}'
+            print(f'[thread_video_read] frame {frame_number} failed: {error}')
+            traceback.print_exc()
+            if tracking_generation is not None:
+                self.temporal_tracker.abort_sequence(tracking_generation)
+            if self.auto_render_active:
+                self.auto_render_write_error = f'Frame {frame_number}: {error}'
+                self.auto_render_processing_error = error
+                self.play = False
+            for item in self.process_qs:
+                if item['FrameNumber'] == frame_number:
+                    item['ProcessedFrame'] = target_image
+                    item['Status'] = 'finished'
+                    item['Error'] = error
+                    item['ThreadTime'] = time.time() - item['ThreadTime']
+                    break
+
+    def _thread_video_read_inner(self, target_image, frame_number,
+                                 tracking_generation=None):
         # The frame is already decoded — process() pulled it from the
         # MediaPlayer's queue. Run the swap (or pass through) and stash the
         # result in this worker's slot for process() to present.
@@ -1730,6 +1853,11 @@ class VideoManager():
         )
         swap_enabled = self.auto_render_active or self.control['SwapFacesButton']
         if not swap_enabled or not in_auto_range:
+            if tracking_generation is not None:
+                self.temporal_tracker.skip(
+                    frame_number, reset=True,
+                    generation=tracking_generation,
+                )
             # Pass the decoder output through untouched — the Qt preview
             # handles both CUDA HxWx3 uint8 tensors (fast path) and numpy
             # (CPU fallback). Avoid the GPU->CPU bounce that would force
@@ -1738,12 +1866,14 @@ class VideoManager():
         else:
             output = self.swap_video(
                 target_image, frame_number, not self.auto_render_active,
+                temporal_generation=tracking_generation,
             )
 
         for item in self.process_qs:
             if item['FrameNumber'] == frame_number:
                 item['ProcessedFrame'] = output
                 item['Status'] = 'finished'
+                item['Error'] = None
                 item['ThreadTime'] = time.time() - item['ThreadTime']
                 break
 
@@ -1751,12 +1881,14 @@ class VideoManager():
 
 
     # @profile
-    def swap_video(self, target_image, frame_number, use_markers):
+    def swap_video(self, target_image, frame_number, use_markers,
+                   temporal_generation=None):
         with nvtx_range(f"swap_video[f={frame_number}]"):
             worker_stream = self._get_worker_stream()
             with torch.cuda.stream(worker_stream):
                 result = self._swap_video_inner(
                     target_image, frame_number, use_markers,
+                    temporal_generation=temporal_generation,
                 )
             # Cross-stream wait, not a host sync. Anyone reading `result`
             # on the global default stream (the GUI thread that uploads
@@ -1768,7 +1900,8 @@ class VideoManager():
             torch.cuda.default_stream().wait_stream(worker_stream)
             return result
 
-    def _swap_video_inner(self, target_image, frame_number, use_markers):
+    def _swap_video_inner(self, target_image, frame_number, use_markers,
+                          temporal_generation=None):
         # Grab a local copy of the parameters to prevent threading issues
         parameters = (
             self.auto_render_parameters
@@ -1820,6 +1953,22 @@ class VideoManager():
         elif img_y<512:
             tscale = v2.Resize((512, int(512*img_x/img_y)), antialias=False)
             img = tscale(img)    
+
+        temporal_enabled = (
+            temporal_generation is not None
+            and bool(parameters.get(
+                'TemporalTrackingSwitch',
+                self.parameters.get('TemporalTrackingSwitch', False),
+            ))
+        )
+        signature_source = img if temporal_enabled else None
+        if temporal_generation is not None and not temporal_enabled:
+            # A marker may disable stabilization for part of a timeline; the
+            # ordered sequence must still advance through those frames.
+            self.temporal_tracker.skip(
+                frame_number, reset=True,
+                generation=temporal_generation,
+            )
 
         # Decide how much to rotate the frame before detection.
         # Auto mode (OrientAutoSwitch) probes 4 orientations on first frame
@@ -1873,7 +2022,85 @@ class VideoManager():
             face_emb, _ = self.models.run_recognize(img, face_kps)
             ret.append([face_kps, face_emb])
         
-        if ret:
+        if temporal_enabled:
+            threshold = float(parameters["ThresholdSlider"])
+            frame_signature = self._temporal_frame_signature(signature_source)
+            slots = []
+            slot_by_key = {}
+            for found_face in self.found_faces:
+                if not found_face.get("SourceFaceAssignments"):
+                    continue
+                target_embedding = found_face.get("Embedding")
+                source_embedding = found_face.get("AssignedEmbedding")
+                if target_embedding is None or source_embedding is None:
+                    continue
+                try:
+                    key = make_slot_key(target_embedding, source_embedding)
+                except (TypeError, ValueError):
+                    continue
+                slots.append({'key': key})
+                slot_by_key[key] = found_face
+
+            observations = []
+            for face_kps, face_embedding in ret:
+                similarities = {}
+                for key, found_face in slot_by_key.items():
+                    try:
+                        similarities[key] = self.findCosineDistance(
+                            face_embedding, found_face['Embedding'],
+                        )
+                    except Exception:
+                        continue
+                observations.append({
+                    'kps': face_kps,
+                    'similarities': similarities,
+                })
+
+            tracking_matches = self.temporal_tracker.process(
+                frame_number,
+                observations,
+                frame_signature,
+                eligible=True,
+                slots=slots,
+                threshold=threshold,
+                frame_size=(int(img.shape[2]), int(img.shape[1])),
+                orientation=applied_angle,
+                generation=temporal_generation,
+            )
+            for match in tracking_matches:
+                best_slot = slot_by_key.get(match['slot_key'])
+                if best_slot is None:
+                    continue
+                best_sim = float(match['similarity'])
+                if not self._swap_diag_done:
+                    try:
+                        src_target_sim = self.findCosineDistance(
+                            best_slot["AssignedEmbedding"], best_slot["Embedding"]
+                        )
+                    except Exception:
+                        src_target_sim = float('nan')
+                    mode = 'predicted' if match.get('predicted') else 'detected'
+                    print(
+                        '[swap_diag] matched '
+                        f'frame={frame_number} similarity={best_sim:.2f} '
+                        f'threshold={threshold:.2f} tracking={mode} '
+                        f'source_vs_target={src_target_sim:.2f} '
+                        f'assignments={best_slot.get("SourceFaceAssignments")}',
+                        flush=True,
+                    )
+                with nvtx_range("swap_core"):
+                    img = self.swap_core(
+                        img, match['kps'], best_slot["AssignedEmbedding"],
+                        parameters, control, slot=best_slot,
+                    )
+
+            img = img.permute(1,2,0)
+            if not control['MaskViewButton'] and applied_angle != 0.0:
+                img = img.permute(2,0,1)
+                img = transforms.functional.rotate(img, angle=-applied_angle, expand=True)
+                img = img.permute(1,2,0)
+
+        elif ret:
             # For each detected face in the frame, find the best-matching
             # entry in self.found_faces and (if it has a source assignment)
             # swap it. Detected faces are independent of each other: a slot

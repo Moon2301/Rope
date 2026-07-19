@@ -170,6 +170,9 @@ PARAMETERS: list[Parameter] = [
     SwitchParam("OrientAutoSwitch", "Auto-detect Orientation"),
     SliderParam("OrientSlider", "Angle"),
 
+    # ---- Temporal video alignment
+    SwitchParam("TemporalTrackingSwitch", "Temporal Stabilization"),
+
     # ---- Strength
     SwitchParam("StrengthSwitch", "Strength"),
     SliderParam("StrengthSlider", "Amount"),

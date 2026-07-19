@@ -18,6 +18,7 @@ Rope implements the insightface inswapper_128 model with a helpful GUI.
 * XSeg masker
 * Easier Embedding management. Drag and drop embeddings to reorder them.
 * New Capture mode. Move and resize a window on your desktop to swap whatever is in it.
+* Five-point temporal stabilization for smoother video alignment and safer identity tracking.
 
 ### Single-character Auto Job
 
@@ -32,6 +33,14 @@ checkpointed inside each five-minute chunk every 100 model calls or ten
 seconds. Render checkpoints are finalized every 60 seconds, so a cancel,
 crash, or application restart only repeats the unfinished scan block or render
 part. Open **Resume Auto Job** to continue.
+
+**Temporal Stabilization** is enabled by default in the Parameters tab for
+video preview and recording. RetinaFace/SCRFD and ArcFace still use their raw
+five landmarks for detection and recognition; Rope filters only the resulting
+alignment transform before swapping. Matching is one-to-one, scene cuts and
+seeks reset the tracker, and a confident track may coast for at most one missed
+detector frame. Auto Job render checkpoints also preserve tracker state across
+60-second part boundaries.
 
 Long-video scanning keeps the sensitive 0.5-second coarse pass and refines
 every three frames within one second of hits and near-hits. Cache keys include

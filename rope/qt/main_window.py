@@ -1504,12 +1504,17 @@ class MainWindow(QMainWindow):
             dialog.set_render_progress(payload)
         job = self._active_auto_job
         part = int(payload.get('part', 0))
+        checkpoint_complete = bool(payload.get('checkpoint_complete'))
         if (job is not None and JobState(job.state) == JobState.RENDERING
-                and part != getattr(self, '_auto_job_checkpoint_part', -1)):
+                and (checkpoint_complete
+                     or part != getattr(self, '_auto_job_checkpoint_part', -1))):
             self._auto_job_checkpoint_part = part
             try:
+                checkpoint_payload = dict(job.render_checkpoint or {})
+                checkpoint_payload.update(payload)
                 self._active_auto_job = self._automation.transition(
-                    job, JobState.RENDERING, render_checkpoint=payload,
+                    job, JobState.RENDERING,
+                    render_checkpoint=checkpoint_payload,
                 )
             except ValueError:
                 pass

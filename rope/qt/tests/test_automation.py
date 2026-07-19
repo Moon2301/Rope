@@ -93,6 +93,31 @@ class AutomationJobTests(unittest.TestCase):
         self.assertTrue(marked[0].review_required)
         self.assertEqual(3, len(marked[0].review_reasons))
 
+    def test_render_checkpoint_keeps_temporal_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = os.path.join(directory, 'input.mp4')
+            with open(video, 'wb') as handle:
+                handle.write(b'video')
+            controller = AutomationController(os.path.join(directory, 'jobs'))
+            job = controller.begin_scan(controller.start_job(self._request(directory, video)))
+            job = controller.set_scan_results(job, [
+                {'start_frame': 0, 'end_frame': 20, 'confidence': 90, 'approved': True},
+            ])
+            job = controller.confirm_segments(job, job.segments, {'TemporalTrackingSwitch': True})
+            checkpoint = {
+                'part': 1,
+                'tracking_version': 1,
+                'tracking_checkpoint': {'version': 1, 'next_frame': 1800},
+            }
+            controller.transition(
+                job, JobState.RENDERING, render_checkpoint=checkpoint,
+            )
+            reloaded = controller.store.load(job.job_id)
+            self.assertEqual(
+                1800,
+                reloaded.render_checkpoint['tracking_checkpoint']['next_frame'],
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

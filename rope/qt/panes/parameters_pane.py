@@ -56,6 +56,7 @@ SECTIONS: list[tuple[str, list[str]]] = [
         "RestorerDetTypeTextSel", "RestorerSlider",
     ]),
     ("Orientation", ["OrientSwitch", "OrientAutoSwitch", "OrientSlider"]),
+    ("Tracking", ["TemporalTrackingSwitch"]),
     ("Likeness / Fidelity", [
         "LikenessSlider", "EmbExtrapSlider",
         "HighFidelitySwitch", "HighFidelityAlphaSlider",
