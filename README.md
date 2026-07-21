@@ -1,5 +1,3 @@
-<img width="2343" height="1375" alt="Screenshot 2026-07-11 132434" src="https://github.com/user-attachments/assets/abb3cfe1-9ec6-4ce5-b8fe-8c9de7a45294" />
-
 Rope implements the insightface inswapper_128 model with a helpful GUI.
 ### Updates for Rope-Bronze: ###
 * New, more responsive UI
