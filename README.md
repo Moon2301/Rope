@@ -1,13 +1,6 @@
 <img width="2343" height="1375" alt="Screenshot 2026-07-11 132434" src="https://github.com/user-attachments/assets/abb3cfe1-9ec6-4ce5-b8fe-8c9de7a45294" />
 
 Rope implements the insightface inswapper_128 model with a helpful GUI.
-### [Discord](https://discord.gg/EcdVAFJzqp)
-
-### [Donate](https://www.paypal.com/donate/?hosted_button_id=Y5SB9LSXFGRF2)
-
-### ${{\color{Goldenrod}{\textsf{Last Updated 2026-07-11}}}}$ ###
-### ${{\color{Goldenrod}{\textsf{Welcome to Rope-Bronze!}}}}$ ###
-
 ### Updates for Rope-Bronze: ###
 * New, more responsive UI
 * TRT Engine for better performance
