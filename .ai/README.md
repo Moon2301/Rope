@@ -9,6 +9,10 @@ This directory is a map for developers and AI agents working on Rope. It documen
 - [STATE_AND_DATA.md](STATE_AND_DATA.md): state machines, manifests, caches, parameters, and invalidation rules.
 - [CODE_RULES.md](CODE_RULES.md): mandatory rules for modifying the current codebase.
 - [PERFORMANCE_BACKLOG.md](PERFORMANCE_BACKLOG.md): verified hotspots, priorities, target designs, and acceptance criteria.
+- [MODEL_CATALOG.md](MODEL_CATALOG.md): exact model files, feature gates, shapes, providers, and missing-file behavior.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md): symptom-driven diagnosis and recovery steps.
+- [DEVELOPMENT.md](DEVELOPMENT.md): setup, tests, smoke checks, profiling, and contribution workflow.
+- [API_CONTRACTS.md](API_CONTRACTS.md): signal payloads, frame/tensor contracts, and internal APIs.
 
 ## Current scope
 
