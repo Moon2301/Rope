@@ -1,30 +1,30 @@
-# Tài liệu kỹ thuật Rope
+# Rope Technical Documentation
 
-Thư mục này là bản đồ dành cho người và AI agent khi sửa Rope. Nội dung mô tả **code đang tồn tại trên nhánh hiện tại**; các thay đổi chưa làm được ghi riêng trong [PERFORMANCE_BACKLOG.md](PERFORMANCE_BACKLOG.md), không trộn với hành vi runtime.
+This directory is a map for developers and AI agents working on Rope. It documents the **code that exists on the current branch**. Planned work is kept separately in [PERFORMANCE_BACKLOG.md](PERFORMANCE_BACKLOG.md) so proposed behavior is never confused with runtime behavior.
 
-## Đọc theo nhu cầu
+## Reading guide
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): entrypoint, module, ownership, thread và GPU pipeline.
-- [FLOWS.md](FLOWS.md): flow startup, chọn media, nhận diện/gán mặt, preview, scrub, record và Auto Job.
-- [STATE_AND_DATA.md](STATE_AND_DATA.md): state machine, manifest, cache, tham số và quy tắc invalidation.
-- [CODE_RULES.md](CODE_RULES.md): quy tắc bắt buộc khi sửa code hiện tại.
-- [PERFORMANCE_BACKLOG.md](PERFORMANCE_BACKLOG.md): các hotspot đã đối chiếu với code, thứ tự ưu tiên và tiêu chí nghiệm thu.
+- [ARCHITECTURE.md](ARCHITECTURE.md): entrypoint, modules, ownership, threads, and the GPU pipeline.
+- [FLOWS.md](FLOWS.md): startup, media selection, face detection and assignment, preview, scrubbing, recording, and Auto Job flows.
+- [STATE_AND_DATA.md](STATE_AND_DATA.md): state machines, manifests, caches, parameters, and invalidation rules.
+- [CODE_RULES.md](CODE_RULES.md): mandatory rules for modifying the current codebase.
+- [PERFORMANCE_BACKLOG.md](PERFORMANCE_BACKLOG.md): verified hotspots, priorities, target designs, and acceptance criteria.
 
-## Phạm vi hiện tại
+## Current scope
 
-- UI chính là Qt/PySide6; entrypoint là [`Rope.py`](../Rope.py).
-- Một `VideoManager` giữ media session, playback, scrub, swap và record.
-- Model được lazy-load qua `Models`; backend có thể là ONNX Runtime CUDA hoặc TensorRT EP.
-- Auto Job xử lý một video, một target slot và một source embedding, bắt buộc user duyệt segment trước render.
-- Temporal stabilization dùng 5 landmark và chỉ áp dụng cho video preview/manual record/Auto Job khi switch bật.
-- Scan segment và render là hai pha độc lập: tracking là render parameter, không làm invalid scan cache.
+- The primary UI is Qt/PySide6; the entrypoint is [`Rope.py`](../Rope.py).
+- One `VideoManager` owns the active media session, playback, scrubbing, swapping, and recording.
+- Models are loaded lazily through `Models`; backends can use ONNX Runtime CUDA or TensorRT EP.
+- An Auto Job processes one video, one target slot, and one source embedding. The user must review segments before rendering.
+- Temporal stabilization uses five landmarks and applies only to video preview, manual recording, and Auto Job rendering when enabled.
+- Segment scanning and rendering are independent phases: tracking is a render parameter and does not invalidate the scan cache.
 
-## Quy ước cập nhật tài liệu
+## Documentation maintenance rules
 
-Khi thay đổi kiến trúc hoặc format dữ liệu:
+When architecture or data formats change:
 
-1. Sửa tài liệu cùng commit với code.
-2. Dẫn chiếu theo tên class/hàm thay vì số dòng vì line number thay đổi nhanh.
-3. Gắn rõ một mục là `Hiện trạng`, `Đề xuất` hoặc `Đã hoàn tất`.
-4. Nếu đổi manifest/cache schema, tăng version và ghi đường nâng cấp hoặc hành vi fallback.
-5. Không ghi secret, đường dẫn máy cá nhân hoặc model binary vào `.ai`.
+1. Update these documents in the same commit as the code.
+2. Link to classes and functions instead of line numbers because line numbers change frequently.
+3. Clearly label content as `Current behavior`, `Proposal`, or `Completed`.
+4. When a manifest or cache schema changes, increment its version and document migration or fallback behavior.
+5. Never store secrets, developer-specific paths, or model binaries in `.ai`.

@@ -1,204 +1,204 @@
-# Performance backlog đã đối chiếu code
+# Verified Performance Backlog
 
-Đây là các thay đổi **chưa được xem là hoàn tất**. Ưu tiên dựa trên ROI, độ đúng và phạm vi rủi ro. Không gộp tất cả vào một commit vì rất khó xác định regression.
+The changes below are **not considered implemented**. Priorities reflect expected return, correctness impact, and implementation risk. Do not combine every item into one commit; that would make regressions difficult to isolate.
 
-## Thứ tự đề xuất
+## Recommended order
 
-| Ưu tiên | Hạng mục | ROI dự kiến | Rủi ro |
+| Priority | Item | Expected return | Risk |
 |---|---|---:|---:|
-| P0 | Sửa `MediaCache` atomic save + thêm face cache | Cao, sửa bug thật | Thấp |
-| P1 | ArcFace direct ROI warp + batch faces | Rất cao khi frame lớn/nhiều face | Trung bình-cao |
-| P1 | Scrub debounce/latest-only + single emit | Cao cho UX | Trung bình |
-| P1 | Manual FFmpeg dùng rawvideo | Cao khi record | Trung bình |
-| P1 | Worker tuần tự cho task nặng từ GUI | Cao cho responsiveness | Trung bình-cao |
-| P2 | Reuse RetinaFace output buffers | Trung bình | Trung bình |
-| P2 | SCRFD GPU postprocess/cache anchors | Cao nếu dùng SCRFD | Cao |
-| P2 | Quick wins timer/cache/slot cleanup | Nhỏ-trung bình | Thấp |
+| P0 | Fix atomic `MediaCache` writes and add face caching | High; fixes a real bug | Low |
+| P1 | Direct ArcFace ROI warp and face batching | Very high for large frames or multiple faces | Medium–high |
+| P1 | Scrub debounce/latest-only and single signal emission | High UX impact | Medium |
+| P1 | Use rawvideo for manual FFmpeg recording | High during recording | Medium |
+| P1 | Move heavy GUI-triggered work to a serialized worker | High responsiveness impact | Medium–high |
+| P2 | Reuse RetinaFace output buffers | Medium | Medium |
+| P2 | Keep SCRFD post-processing on GPU and cache anchors | High when SCRFD is used | High |
+| P2 | Timer, allocator, and process-slot quick wins | Low–medium | Low |
 
-## P0 — MediaCache hoạt động đúng và cache source face
+## P0 — Make MediaCache reliable and persist source faces
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-- `MediaCache._atomic_savez()` tạo `tmp = target + '.tmp'` rồi gọi `np.savez(tmp, ...)`.
-- NumPy tạo file `*.tmp.npz`, còn `os.replace()` tìm `*.tmp`; destination không xuất hiện.
-- Có `load_face()` nhưng không có `store_face()`.
-- `ThumbnailLoader` đọc face cache nhưng sau cache miss chỉ decode thumbnail, không lưu embedding/crop.
-- `MainWindow._source_face_embeddings` chỉ cache embedding trong RAM của phiên chạy.
+- `MediaCache._atomic_savez()` builds `tmp = target + '.tmp'` and calls `np.savez(tmp, ...)`.
+- NumPy creates `*.tmp.npz`, while `os.replace()` looks for `*.tmp`; the destination is never created.
+- `load_face()` exists, but `store_face()` does not.
+- `ThumbnailLoader` reads the face cache but, after a cache miss, only decodes a thumbnail and never persists an embedding or crop.
+- `MainWindow._source_face_embeddings` caches embeddings only in memory for the active process.
 
-### Thiết kế đích
+### Target design
 
-- Ghi `np.savez()` vào binary file handle đã mở, hoặc dùng temp path kết thúc `.npz` và replace đúng tên.
-- Thêm `store_face(path, fingerprint, thumbnail, embedding, metadata)`.
-- Key/fingerprint tối thiểu: absolute path, size, `mtime_ns`, detector, detect score, input size, recognizer/model version.
-- Tách thumbnail-only khỏi embedding-ready để gallery không bắt buộc load model.
-- Source embedding worker ghi cache sau detect/recognize thành công; corrupt entry tự tính lại.
+- Write `np.savez()` to an open binary file handle, or use a temporary path that already ends with `.npz` and replace the exact resulting file.
+- Add `store_face(path, fingerprint, thumbnail, embedding, metadata)`.
+- The minimum key/fingerprint includes absolute path, size, `mtime_ns`, detector, detection score, input size, and recognizer/model version.
+- Separate thumbnail-only entries from embedding-ready entries so the gallery does not need to load models.
+- Persist a source embedding after successful detection/recognition; recompute corrupt entries automatically.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- Round-trip tạo đúng destination và không còn orphan `*.tmp.npz`.
-- Restart app rồi chọn cùng source không gọi detector/ArcFace lại.
-- Sửa ảnh hoặc config recognition làm cache miss.
-- Hai process ghi cùng key không tạo file nửa vời.
+- A round-trip creates the exact destination and leaves no orphan `*.tmp.npz` files.
+- After restarting the app, selecting the same source does not rerun the detector or ArcFace.
+- Editing the image or recognition configuration produces a cache miss.
+- Two processes writing the same key cannot expose a partial file.
 
-## P1 — ArcFace direct ROI warp và batch
+## P1 — Direct ArcFace ROI warp and batching
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-`Models.recognize()` tính similarity transform rồi gọi `v2.functional.affine()` trên **toàn bộ frame**, sau đó mới crop vùng `dim*112 × dim*112`. Mỗi face chạy session riêng theo tile trong vòng lặp `dim × dim`; output `(1, 512)` cũng cấp phát mỗi call.
+`Models.recognize()` estimates a similarity transform, calls `v2.functional.affine()` on the **entire frame**, and only then crops the `dim*112 × dim*112` region. Every face runs the session separately for each `dim × dim` tile, and the `(1, 512)` output is allocated per call.
 
-Ở 1920×1080 so với 112×112, warp toàn frame xử lý xấp xỉ 165 lần số pixel của ROI cho mỗi face. Tỷ lệ này chỉ mô tả pixel count, không phải cam kết FPS.
+At 1920×1080 versus 112×112, full-frame warping touches approximately 165 times as many pixels as the ROI for each face. This ratio describes pixel count, not a guaranteed FPS improvement.
 
-### Thiết kế đích
+### Target design
 
-- Từ transform detector→ArcFace, dựng affine grid trực tiếp cho output 112×112.
-- Dùng `torch.nn.functional.grid_sample()` hoặc kernel tương đương trên source frame, không materialize warped full frame.
-- Gom mọi face của cùng frame thành batch `N×3×112×112` và chạy ArcFace một lần nếu session/profile hỗ trợ dynamic batch.
-- Reuse input/output buffer theo batch capacity; có fallback batch=1 cho TRT engine static.
-- Giữ đúng interpolation, coordinate convention, BGR và normalization của đường cũ.
+- Derive an affine grid for a direct 112×112 output from the detector-to-ArcFace transform.
+- Use `torch.nn.functional.grid_sample()` or an equivalent kernel on the source frame without materializing a full warped frame.
+- Batch all faces from one frame into `N×3×112×112` and run ArcFace once when the session/profile supports dynamic batching.
+- Reuse input/output buffers by batch capacity, with a batch-1 fallback for static TensorRT engines.
+- Preserve the old path's interpolation, coordinate convention, BGR order, and normalization exactly.
 
-### Thứ tự triển khai an toàn
+### Safe implementation sequence
 
-1. Thêm helper direct crop batch nhưng vẫn inference từng face.
-2. Golden-test crop/embedding với đường cũ trên center, edge, scale và rotated face.
-3. Sau khi alignment tương đương mới bật batch ArcFace.
-4. Benchmark detector riêng, recognize riêng và end-to-end.
+1. Add a direct-crop batch helper while still running inference once per face.
+2. Golden-test crops and embeddings against the old path for centered, edge, scaled, and rotated faces.
+3. Enable batched ArcFace only after alignment equivalence is established.
+4. Benchmark detector, recognizer, and end-to-end performance separately.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- Crop sai khác trong tolerance đã định; cosine embedding đường mới/đường cũ đủ cao trên tập pose.
-- Không cắt mất mặt sát mép; padding giống đường cũ.
-- Batch 1 và batch N trả đúng thứ tự detection.
-- VRAM không tăng không giới hạn; throughput tăng có số đo ở 720p/1080p/4K.
+- Crop differences remain within an explicit tolerance, and new/old embedding cosine similarity remains sufficiently high across a pose set.
+- Faces near image boundaries are not truncated, and padding matches the old path.
+- Batch 1 and batch N preserve detection ordering.
+- VRAM does not grow without bound, and throughput improvements are measured at 720p, 1080p, and 4K.
 
-## P1 — Scrub debounce và latest-only
+## P1 — Scrub debounce and latest-only execution
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-- VM dùng `deque(maxlen=5)` và scrub thread `popleft()` FIFO; mọi request còn lại đều decode/swap.
-- Coordinator không coalesce event.
-- `ParameterSlider._on_entry_committed()` có thể emit từ `setValue()` rồi emit lại vì điều kiện sau set luôn đúng.
-- `ParameterSlider.set(request_frame=True)` cũng có thể vừa nhận `valueChanged`, vừa emit explicit.
+- VM uses `deque(maxlen=5)`, and the scrub thread consumes it with FIFO `popleft()`; every remaining request is decoded and swapped.
+- Coordinator does not coalesce events.
+- `ParameterSlider._on_entry_committed()` can emit once from `setValue()` and then emit again because its post-set condition is always true.
+- `ParameterSlider.set(request_frame=True)` can receive `valueChanged` and also emit explicitly.
 
-### Thiết kế đích
+### Target design
 
-- GUI debounce single-shot 16–33 ms cho drag.
-- VM giữ duy nhất request pending mới nhất; frame đang xử lý có generation id và không publish nếu stale.
-- Mouse release/entry commit bắt buộc publish final frame.
-- Sửa slider: so `old_pos` trước `setValue()`; chỉ explicit emit khi position không đổi hoặc block signal và emit đúng một nơi.
+- Use a 16–33 ms single-shot GUI debounce during dragging.
+- VM retains only the latest pending request; in-flight work receives a generation ID and must not publish when stale.
+- Mouse release and entry commit always publish the final requested frame.
+- Fix slider emission by comparing `old_pos` before `setValue()`, or block the slider signal and emit from exactly one location.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- 100 event drag nhanh dẫn tới tối đa một in-flight + một pending.
-- Preview cuối cùng luôn là frame user thả.
-- Một entry commit/`set(..., request_frame=True)` emit đúng một lần.
-- Seek/stop không deadlock temporal coordinator.
+- A burst of 100 drag events produces at most one in-flight and one pending request.
+- The final preview always displays the frame where the user released the control.
+- One entry commit or `set(..., request_frame=True)` call emits exactly once.
+- Seek and stop cannot deadlock the temporal coordinator.
 
-## P1 — Manual FFmpeg rawvideo
+## P1 — Rawvideo for manual FFmpeg recording
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-- Auto Render đã mở FFmpeg với `-f rawvideo -pixel_format rgb24 -video_size ...` và ghi bytes contiguous.
-- Manual FFMPEG dùng input pipe không khai báo rawvideo; mỗi frame tạo `PIL.Image` và encode BMP vào stdin.
+- Auto Render starts FFmpeg with `-f rawvideo -pixel_format rgb24 -video_size ...` and writes contiguous bytes.
+- Manual FFMPEG recording uses an input pipe without declaring rawvideo; it creates a `PIL.Image` and BMP-encodes every frame into stdin.
 
-### Thiết kế đích
+### Target design
 
-- Tách helper tạo FFmpeg rawvideo encoder dùng chung cho manual và Auto Render.
-- Manual ghi `np.ascontiguousarray(image, dtype=np.uint8).tobytes()`.
-- Giữ mux audio gốc sau encode và semantics start/stop marker.
-- Codec policy có thể giữ `libx264` cho manual trước; NVENC là thay đổi riêng.
+- Extract a shared FFmpeg rawvideo encoder helper for manual recording and Auto Render.
+- Write `np.ascontiguousarray(image, dtype=np.uint8).tobytes()` from the manual path.
+- Preserve original-audio muxing and start/stop marker semantics.
+- Keep manual recording on `libx264` initially; NVENC policy can remain a separate change.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- Không còn `Image.fromarray(...).save(..., 'BMP')` trong record hot path.
-- Output RGB đúng màu, resolution/FPS/frame count/duration đúng.
-- Broken pipe đóng record sạch, không treo GUI.
-- Audio mux và đoạn record theo playhead không lệch.
+- No `Image.fromarray(...).save(..., 'BMP')` remains in the recording hot path.
+- Output has correct RGB color, resolution, FPS, frame count, and duration.
+- A broken pipe closes recording cleanly without freezing the GUI.
+- Audio muxing and playhead-based recording boundaries remain synchronized.
 
-## P1 — Đưa task nặng khỏi GUI thread
+## P1 — Move heavy work off the GUI thread
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-- `_on_find_faces()` gọi detect/recognize đồng bộ.
-- `_on_source_face_selection_changed()` tuần tự tính embedding ảnh chưa cache.
-- Chọn target emit signal cùng thread vào `VideoManager.load_target_video()`, nơi tạo `MediaPlayer` và lấy first frame.
-- Auto scan và QC đã là mẫu tốt: `QRunnable` + signal.
+- `_on_find_faces()` runs detection and recognition synchronously.
+- `_on_source_face_selection_changed()` computes every uncached image embedding sequentially.
+- Selecting a target emits a same-thread signal into `VideoManager.load_target_video()`, which creates `MediaPlayer` and reads the first frame.
+- Auto scan and QC already provide a suitable pattern using `QRunnable` and signals.
 
-### Thiết kế đích
+### Target design
 
-- Một serialized GPU task queue cho preload/find/source embedding/open-first-frame để không tranh session/VRAM.
-- Mỗi request có generation; đổi media/selection làm result cũ bị discard.
-- UI hiển thị busy/progress và vẫn xử lý repaint/cancel.
-- Tách open metadata/decode first frame khỏi commit state: worker chuẩn bị, GUI/VM commit nếu generation còn đúng.
+- Add one serialized GPU task queue for preload, Find Faces, source embedding, and media-open/first-frame work so sessions and VRAM are not contended.
+- Attach a generation to every request; changing media or selection discards stale results.
+- Keep repaint and cancellation responsive while exposing busy/progress state.
+- Split media open into prepare and commit phases: a worker reads metadata/first frame, then GUI/VM commits only if the generation is still current.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- Window kéo/resize được trong cold model load và chọn nhiều ảnh.
-- Chọn video A rồi B nhanh không publish first frame của A sau B.
-- Không có hai GPU inference job loại này chạy đồng thời.
-- Cancel/exception luôn release busy state.
+- The window remains movable and resizable during cold model loading and multi-image selection.
+- Selecting video A and then B quickly can never publish A's first frame after B.
+- No two GPU inference tasks from this queue run simultaneously.
+- Cancellation and exceptions always release busy state.
 
 ## P2 — Reuse RetinaFace output buffers
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-RetinaFace đã có thread-local input letterbox buffer và cache anchor. Tuy nhiên mỗi `detect_retinaface()` vẫn tạo 9 CUDA tensor output: score/bbox/kps cho stride 8/16/32.
+RetinaFace already has a thread-local input letterbox buffer and an anchor cache. However, every `detect_retinaface()` call still allocates nine CUDA output tensors: score, bbox, and keypoints for strides 8, 16, and 32.
 
-### Thiết kế đích
+### Target design
 
-- Thread-local output cache theo input `(H,W)`, dtype và device.
-- Bind ORT vào buffer cache; consumer hoàn tất trước khi buffer cùng worker bị reuse.
-- Giới hạn số profile size được giữ hoặc clear khi unload/backend đổi.
+- Add a thread-local output cache keyed by input `(H, W)`, dtype, and device.
+- Bind ORT outputs to cached buffers; consumers must finish before the same worker reuses them.
+- Bound the number of retained input profiles, or clear them when unloading or changing backend.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- Steady-state không còn 9 `torch.empty` mỗi frame.
-- Output/NMS bitwise hoặc tolerance-equivalent.
-- Per-thread session 1–5 worker không ghi đè buffer nhau.
+- Steady-state execution no longer creates nine `torch.empty` tensors per frame.
+- Output and NMS are bitwise-equivalent or within an explicit numerical tolerance.
+- Per-thread sessions with 1–5 workers never overwrite another worker's buffers.
 
-## P2 — SCRFD giữ postprocess trên GPU
+## P2 — Keep SCRFD post-processing on GPU
 
-### Hiện trạng đã xác nhận
+### Verified current behavior
 
-- SCRFD gọi `io_binding.copy_outputs_to_cpu()`.
-- `center_cache = {}` được tạo lại trong mỗi detect.
-- Sau CPU decode/sort, boxes/scores lại được upload CUDA để `torchvision.ops.nms()`.
-- Preprocess cũng cấp phát letterbox tensor mới và permute/materialize nhiều bước.
+- SCRFD calls `io_binding.copy_outputs_to_cpu()`.
+- `center_cache = {}` is recreated for every detection.
+- After CPU decode and sorting, boxes and scores are uploaded to CUDA again for `torchvision.ops.nms()`.
+- Preprocessing also allocates a new letterbox tensor and performs several permute/materialize steps.
 
-### Thiết kế đích
+### Target design
 
-- Bind output vào CUDA tensor như RetinaFace.
-- Cache anchor center lâu dài theo `(input_h,input_w,stride,device,dtype)`.
-- Decode bbox/kps, threshold, sort và NMS trên GPU; chỉ copy final small kps về nơi thật sự cần.
-- Reuse preprocess/output buffer thread-local.
+- Bind outputs to CUDA tensors as RetinaFace already does.
+- Persist anchor centers by `(input_h, input_w, stride, device, dtype)`.
+- Decode bbox/keypoints, threshold, sort, and run NMS on GPU; copy only the small final keypoint result when truly necessary.
+- Reuse preprocessing and output buffers per thread.
 
-### Nghiệm thu
+### Acceptance criteria
 
-- Không có full output GPU→CPU→GPU round-trip.
-- Detection/kps tương đương đường cũ trên bộ regression.
-- Không tăng VRAM theo số frame hoặc đổi input size lặp lại.
+- No full-output GPU→CPU→GPU round trip remains.
+- Detection and keypoints match the old path on a regression set.
+- VRAM remains stable across frames and repeated input-size changes.
 
-## P2 — Quick wins tài nguyên
+## P2 — Resource quick wins
 
 ### Coordinator timer
 
-`Coordinator._tick()` hiện chỉ telemetry queue/VRAM nhưng `QTimer` interval vẫn là 0 ms. Đổi 50–100 ms là đủ cho HUD và giảm wake-up CPU; frame delivery đã push-based.
+`Coordinator._tick()` now handles only queue and VRAM telemetry, but its `QTimer` interval remains 0 ms. A 50–100 ms interval is sufficient for the HUD and reduces idle CPU wakeups because frame delivery is already push-based.
 
-### Stop và CUDA allocator
+### Stop and the CUDA allocator
 
-`play_video('stop')` và `stop_from_gui` gọi `torch.cuda.empty_cache()` mỗi lần. Stop thường chỉ nên abort/dừng queue và bỏ reference. Chỉ empty cache khi explicit unload, backend rebuild hoặc recovery có lý do.
+Both `play_video('stop')` and `stop_from_gui` call `torch.cuda.empty_cache()` on every stop. Normal Stop should abort work, stop queues, and release references. Empty the cache only for explicit unload, backend rebuild, or a justified recovery path.
 
 ### ProcessedFrame lifetime
 
-Sau publish preview, slot reset status/thread/frame/time/PTS nhưng chưa đặt `ProcessedFrame` về `None`/`[]`. Record path cũng vậy. Xóa reference ngay sau consumer cuối cùng để tensor/CPU frame được thu hồi sớm.
+After preview publication, a process slot clears status, thread, frame number, timing, and PTS but does not reset `ProcessedFrame`. The recording path behaves similarly. Release the reference immediately after the final consumer to allow earlier tensor/CPU-frame reclamation.
 
-### Nghiệm thu chung
+### Shared acceptance criteria
 
-- Idle CPU giảm có số đo; VRAM indicator vẫn cập nhật trong ≤100 ms.
-- Play/stop lặp lại không tạo memory growth.
-- Peak allocated/reserved memory không xấu hơn và stop nhanh hơn.
-- Slot không giữ tensor của frame đã publish/write.
+- Idle CPU usage decreases measurably while VRAM telemetry still updates within 100 ms.
+- Repeated play/stop cycles do not cause memory growth.
+- Peak allocated/reserved memory does not regress, and Stop latency improves.
+- Process slots retain no tensor from a frame that has already been published or written.
 
-## Cách chia commit
+## Suggested commit sequence
 
 1. `fix(cache): make npz writes atomic and persist face embeddings`
 2. `perf(scrub): debounce and keep only the latest request`
@@ -210,4 +210,4 @@ Sau publish preview, slot reset status/thread/frame/time/PTS nhưng chưa đặt
 8. `perf(scrfd): keep postprocess on CUDA`
 9. `perf(runtime): reduce idle polling and release frame references`
 
-Mỗi commit cần test/benchmark riêng để dễ bisect khi chất lượng swap hoặc stability thay đổi.
+Each commit requires its own tests and benchmarks so quality or stability regressions can be bisected reliably.
